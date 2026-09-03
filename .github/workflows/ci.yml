@@ -1,0 +1,48 @@
+name: regression-validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: ci-password
+      DATABASE_URL: postgresql://document_analyzer:ci-password@postgres:5432/document_analyzer
+      REDIS_URL: redis://redis:6379/0
+      AUTH_SECRET_KEY: ci-only-regression-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest
+      - run: ruff check apps/api
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - working-directory: apps/web
+        run: npm ci
+      - working-directory: apps/web
+        run: npm run test:run -- --pool=threads
+      - working-directory: apps/web
+        run: npm run lint
+      - working-directory: apps/web
+        run: npm run build
+      - working-directory: apps/web
+        run: npm audit --omit=dev --audit-level=high
+      - run: docker compose config --quiet
+      - run: docker compose build api worker web
+      - run: docker compose run --rm worker tesseract --version
+      - run: docker compose run --rm worker sh -c "tesseract --list-langs | grep -Fx eng"
+      - run: docker compose up -d postgres redis
+      - run: docker compose run --rm api alembic upgrade head
+      - run: docker compose up -d --wait api worker
+      - run: RUN_DOCKER_INTEGRATION=1 pytest apps/api/tests/test_docker_regression.py
+      - if: always()
+        run: docker compose logs api worker

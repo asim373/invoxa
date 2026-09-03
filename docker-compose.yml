@@ -1,0 +1,148 @@
+services:
+  storage-init:
+    image: codex_projects-api
+    user: "0:0"
+    command: ["sh", "-c", "chown -R app:app /app/storage"]
+    volumes:
+      - document_storage:/app/storage/documents
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - document_storage:/app/storage/documents
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      QUEUE_RECONCILIATION_INTERVAL_SECONDS: ${QUEUE_RECONCILIATION_INTERVAL_SECONDS:-30}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-100}
+      MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-50000000}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
+      AUTH_ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:5173","http://127.0.0.1:5173"]}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-["localhost","127.0.0.1"]}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-20}
+      FORGOT_PASSWORD_RATE_LIMIT: ${FORGOT_PASSWORD_RATE_LIMIT:-5}
+      FORGOT_PASSWORD_RATE_WINDOW_SECONDS: ${FORGOT_PASSWORD_RATE_WINDOW_SECONDS:-3600}
+      RESET_PASSWORD_RATE_LIMIT: ${RESET_PASSWORD_RATE_LIMIT:-10}
+      RESET_PASSWORD_RATE_WINDOW_SECONDS: ${RESET_PASSWORD_RATE_WINDOW_SECONDS:-900}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:5173}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+      SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
+      PASSWORD_RESET_DEV_OUTBOX_PATH: ${PASSWORD_RESET_DEV_OUTBOX_PATH:-storage/password-reset-outbox}
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    volumes:
+      - document_storage:/app/storage/documents
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      QUEUE_RECONCILIATION_INTERVAL_SECONDS: ${QUEUE_RECONCILIATION_INTERVAL_SECONDS:-30}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-100}
+      MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-50000000}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-u", "-m", "apps.api.app.worker"]
+    healthcheck:
+      test: ["CMD", "tesseract", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "${WEB_PORT:-5173}:5173"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-document_analyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-document_analyzer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  document_storage:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,13 @@
+{
+  "version": "0.2",
+  "words": [
+    "alembic",
+    "openpyxl",
+    "pypdfium",
+    "pyright",
+    "pytesseract",
+    "pwdlib",
+    "tesseract"
+  ]
+}
+

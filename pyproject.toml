@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "document-invoice-analyzer"
+version = "0.1.0"
+description = "Foundation for a privacy-first document and invoice analyzer."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14,<2.0",
+    "email-validator>=2.2,<3.0",
+    "fastapi>=0.115,<1.0",
+    "openpyxl>=3.1,<4.0",
+    "pwdlib[argon2]>=0.2,<1.0",
+    "PyJWT>=2.10,<3.0",
+    "python-multipart>=0.0.20,<1.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "pypdf>=5.0,<7.0",
+    "pypdfium2>=5.0,<6.0",
+    "pydantic-settings>=2.6,<3.0",
+    "pytesseract>=0.3.13,<1.0",
+    "redis>=5.2,<6.0",
+    "sqlalchemy>=2.0,<3.0",
+    "Pillow>=10.0,<13.0",
+    "uvicorn[standard]>=0.34,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pyright>=1.1.390,<2.0",
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.25,<1.0",
+    "ruff>=0.9,<1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["apps/api/tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pyright]
+include = ["apps/api"]
+exclude = ["**/__pycache__"]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"

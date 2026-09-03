@@ -1,0 +1,535 @@
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { App, DOCUMENT_POLL_INTERVAL_MS } from "./main";
+
+const id = "00000000-0000-4000-8000-000000000001";
+const timestamp = "2026-09-02T00:00:00Z";
+type ActiveStatus = "queued" | "processing" | "completed";
+
+function response(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function item(status: ActiveStatus) {
+  return {
+    id,
+    original_filename: "invoice.pdf",
+    mime_type: "application/pdf",
+    file_size: 100,
+    status,
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+}
+
+const user = {
+  id: "user-1",
+  email: "test@example.com",
+  is_active: true,
+  role: "reviewer",
+  created_at: timestamp,
+  updated_at: timestamp,
+};
+
+async function flush() {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+describe("document live status", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    localStorage.setItem("document_analyzer_token", "test-token");
+    URL.createObjectURL = vi.fn(() => "blob:secure-preview");
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("polls queued/processing documents and stops after completion", async () => {
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    const statuses: ActiveStatus[] = ["queued", "processing", "completed"];
+    let listRequest = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/me")) return Promise.resolve(response(user));
+      const status = statuses[Math.min(listRequest++, statuses.length - 1)];
+      return Promise.resolve(
+        response({ items: [item(status)], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    expect(screen.getAllByText("Queued").length).toBeGreaterThan(0);
+    expect(
+      intervalSpy.mock.calls.filter(([, delay]) => delay === DOCUMENT_POLL_INTERVAL_MS),
+    ).toHaveLength(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_POLL_INTERVAL_MS));
+    await flush();
+    expect(screen.getAllByText("Processing").length).toBeGreaterThan(0);
+
+    await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_POLL_INTERVAL_MS));
+    await flush();
+    expect(screen.getAllByText("Completed").length).toBeGreaterThan(0);
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("page_size=20")),
+    ).toHaveLength(3);
+    await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_POLL_INTERVAL_MS * 2));
+    await flush();
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("page_size=20")),
+    ).toHaveLength(3);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+  });
+
+  it("refreshes selected details when polling observes a terminal state", async () => {
+    let listRequest = 0;
+    let detailStatus: "queued" | "completed" = "queued";
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}`)) {
+        return Promise.resolve(
+          response({
+            ...item(detailStatus),
+            extracted_text: detailStatus === "completed" ? "Persisted final text" : null,
+          }),
+        );
+      }
+      const status = listRequest++ === 0 ? "queued" : "completed";
+      if (status === "completed") detailStatus = "completed";
+      return Promise.resolve(
+        response({ items: [item(status)], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /invoice\.pdf/i }));
+    await flush();
+    await act(async () => vi.advanceTimersByTimeAsync(DOCUMENT_POLL_INTERVAL_MS));
+    await flush();
+    await flush();
+
+    expect(screen.getByText("Persisted final text")).toBeInTheDocument();
+  });
+});
+
+describe("professional document detail", () => {
+  beforeEach(() => {
+    localStorage.setItem("document_analyzer_token", "test-token");
+    URL.createObjectURL = vi.fn(() => "blob:secure-preview");
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("shows authenticated PDF preview, structured fields, line items and clean missing values", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}/file`)) {
+        return Promise.resolve(
+          new Response(new Blob(["pdf"]), { headers: { "Content-Type": "application/pdf" } }),
+        );
+      }
+      if (url.endsWith(`/documents/${id}`)) {
+        return Promise.resolve(
+          response({
+            ...item("completed"),
+            extracted_text: "Invoice Number: INV-42",
+            error_details: null,
+            invoice_extraction: {
+              invoice_number: "INV-42",
+              invoice_date: "2026-09-02",
+              vendor_name: "Acme",
+              customer_name: null,
+              currency: "USD",
+              subtotal: "10.00",
+              tax: "1.00",
+              total: "11.00",
+              is_valid: true,
+              validation_error: null,
+              line_items: [
+                {
+                  position: 0,
+                  description: "Consulting",
+                  quantity: "1.0000",
+                  unit_price: "10.00",
+                  line_total: "10.00",
+                },
+              ],
+            },
+          }),
+        );
+      }
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /invoice\.pdf/i }));
+    await flush();
+    await flush();
+
+    expect(screen.getByTitle("Preview of invoice.pdf")).toHaveAttribute(
+      "src",
+      "blob:secure-preview",
+    );
+    expect(screen.getByText("INV-42")).toBeInTheDocument();
+    expect(screen.getByText("Acme")).toBeInTheDocument();
+    expect(screen.getByText("Not extracted")).toBeInTheDocument();
+    expect(screen.getByText("Consulting")).toBeInTheDocument();
+    const fileCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith(`/documents/${id}/file`),
+    );
+    expect(new Headers(fileCall?.[1]?.headers).get("Authorization")).toBe("Bearer test-token");
+  });
+
+  it("renders an image preview and a meaningful failed-processing error", async () => {
+    const imageItem = {
+      ...item("completed"),
+      original_filename: "scan.png",
+      mime_type: "image/png",
+      status: "failed",
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}/file`))
+        return Promise.resolve(new Response(new Blob(["png"])));
+      if (url.endsWith(`/documents/${id}`))
+        return Promise.resolve(
+          response({
+            ...imageItem,
+            extracted_text: null,
+            error_details: "Image file is corrupt.",
+            invoice_extraction: null,
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [imageItem], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /scan\.png/i }));
+    await flush();
+    await flush();
+
+    expect(screen.getByAltText("Preview of scan.png")).toBeInTheDocument();
+    expect(screen.getByText("Image file is corrupt.")).toBeInTheDocument();
+  });
+
+  it("exports only the supported CSV/XLSX formats with authenticated document context", async () => {
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}/file`))
+        return Promise.resolve(new Response(new Blob(["pdf"])));
+      if (url.endsWith(`/documents/${id}/exports/csv`)) {
+        return Promise.resolve(
+          new Response(new Blob(["zip"]), {
+            headers: {
+              "Content-Disposition": 'attachment; filename="invoice-export-20260902.zip"',
+            },
+          }),
+        );
+      }
+      if (url.endsWith(`/documents/${id}`))
+        return Promise.resolve(
+          response({
+            ...item("completed"),
+            extracted_text: "text",
+            error_details: null,
+            invoice_extraction: null,
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /invoice\.pdf/i }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+    await flush();
+
+    const exportCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith(`/documents/${id}/exports/csv`),
+    );
+    expect(new Headers(exportCall?.[1]?.headers).get("Authorization")).toBe("Bearer test-token");
+    expect(clickSpy).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /export pdf/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("foundation landing page", () => {
+  it("renders the product name", () => {
+    localStorage.clear();
+    render(<App />);
+    expect(
+      screen.getByRole("heading", { name: /document & invoice analyzer/i }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("frontend authentication security", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("clears an expired token and protected state without retrying 401 requests", async () => {
+    localStorage.setItem("document_analyzer_token", "expired-token");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Not authenticated." }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    render(<App />);
+    await flush();
+    await flush();
+
+    expect(localStorage.getItem("document_analyzer_token")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+    expect(screen.getByText("Your session expired. Please sign in again.")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hides mutation controls for a viewer role", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/me"))
+        return Promise.resolve(response({ ...user, role: "viewer" }));
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+    localStorage.setItem("document_analyzer_token", "viewer-token");
+
+    render(<App />);
+    await flush();
+
+    expect(screen.queryByText("Upload document")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reprocess" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+  });
+});
+
+describe("password recovery", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("opens the forgot-password form and shows the generic success response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      response({
+        detail: "If an account exists for this email, password reset instructions have been sent.",
+      }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Forgot password?" }));
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "person@example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send reset instructions" }));
+    await flush();
+
+    expect(screen.getByRole("status")).toHaveTextContent("If an account exists");
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/auth/forgot-password"),
+      expect.objectContaining({ method: "POST" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Back to sign in" }));
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+  });
+
+  it("validates matching reset passwords without sending the token", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/reset-password?token=secret-reset-token-value-that-is-long-enough",
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "ReplacementPassword123!" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "DifferentPassword123!" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reset password" }));
+
+    expect(screen.getByText("Passwords do not match.")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText("secret-reset-token-value-that-is-long-enough"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("handles invalid reset links safely", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/reset-password?token=secret-reset-token-value-that-is-long-enough",
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ detail: "This password reset link is invalid or has expired." }),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        },
+      ),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "ReplacementPassword123!" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "ReplacementPassword123!" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reset password" }));
+    await flush();
+    expect(
+      screen.getByText("This password reset link is invalid or has expired."),
+    ).toBeInTheDocument();
+  });
+
+  it("completes reset, removes the token URL, and returns to login", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/reset-password?token=secret-reset-token-value-that-is-long-enough",
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      response({ detail: "Your password has been reset. You can now sign in." }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "ReplacementPassword123!" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirm password"), {
+      target: { value: "ReplacementPassword123!" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reset password" }));
+    await flush();
+
+    expect(screen.getByRole("status")).toHaveTextContent("Your password has been reset");
+    expect(window.location.search).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Back to sign in" }));
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+  });
+});
+
+describe("export and productivity controls", () => {
+  beforeEach(() => {
+    localStorage.setItem("document_analyzer_token", "test-token");
+    URL.createObjectURL = vi.fn(() => "blob:export");
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("combines search, filters, sorting, and pagination in server requests", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/me")) return Promise.resolve(response(user));
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 21, page: 1, page_size: 20, total_pages: 2 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.change(screen.getByLabelText("Search documents"), { target: { value: "Acme" } });
+    fireEvent.change(screen.getByLabelText("Status"), { target: { value: "completed" } });
+    fireEvent.change(screen.getByLabelText("File type"), { target: { value: "application/pdf" } });
+    fireEvent.change(screen.getByLabelText("Sort"), { target: { value: "filename:asc" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    await flush();
+    const combinedUrl = fetchMock.mock.calls
+      .map(([input]) => String(input))
+      .find((url) => url.includes("search=Acme"));
+    expect(combinedUrl).toContain("status=completed");
+    expect(combinedUrl).toContain("mime_type=application%2Fpdf");
+    expect(combinedUrl).toContain("sort_by=filename");
+    expect(combinedUrl).toContain("sort_direction=asc");
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    await flush();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("page=2"))).toBe(true);
+  });
+
+  it("downloads selected documents in bulk and offers single JSON export", async () => {
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}/file`))
+        return Promise.resolve(new Response(new Blob(["pdf"])));
+      if (url.endsWith(`/documents/${id}`))
+        return Promise.resolve(
+          response({
+            ...item("completed"),
+            extracted_text: "text",
+            error_details: null,
+            invoice_extraction: null,
+          }),
+        );
+      if (url.includes("/exports/json"))
+        return Promise.resolve(
+          new Response(JSON.stringify([]), {
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Disposition": 'attachment; filename="invoice-export.json"',
+            },
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 20, total_pages: 1 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByLabelText("Select invoice.pdf"));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "JSON" }));
+    await flush();
+    const bulkCall = fetchMock.mock.calls.find(([input]) =>
+      String(input).endsWith("/exports/json"),
+    );
+    expect(bulkCall?.[1]?.method).toBe("POST");
+    expect(String(bulkCall?.[1]?.body)).toContain(id);
+
+    fireEvent.click(screen.getByRole("button", { name: /invoice\.pdf/i }));
+    await flush();
+    expect(screen.getByRole("button", { name: "Export JSON" })).toBeInTheDocument();
+  });
+});
