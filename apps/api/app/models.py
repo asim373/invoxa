@@ -4,6 +4,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Date,
@@ -35,6 +36,36 @@ class UserRole(StrEnum):
     ADMIN = "admin"
     REVIEWER = "reviewer"
     VIEWER = "viewer"
+
+
+class AIAnalysisStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class AIFindingSeverity(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class AIFindingStatus(StrEnum):
+    OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+
+
+class AIFindingCategory(StrEnum):
+    ARITHMETIC = "arithmetic_anomaly"
+    DUPLICATE = "duplicate_invoice"
+    AMOUNT = "unusual_amount"
+    VENDOR = "vendor_pattern"
+    MISSING = "missing_information"
+    CONFIDENCE = "low_confidence_extraction"
+    DATE = "date_anomaly"
+    TAX = "tax_consistency"
 
 
 class InvalidDocumentStatusTransition(ValueError):
@@ -122,6 +153,18 @@ class Document(Base):
     )
     error_details: Mapped[str | None] = mapped_column(Text, nullable=True)
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_analysis_status: Mapped[AIAnalysisStatus] = mapped_column(
+        Enum(
+            AIAnalysisStatus,
+            name="ai_analysis_status",
+            values_callable=lambda statuses: [status.value for status in statuses],
+        ),
+        nullable=False,
+        default=AIAnalysisStatus.PENDING,
+        server_default=AIAnalysisStatus.PENDING.value,
+    )
+    ai_analysis_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -135,6 +178,9 @@ class Document(Base):
         back_populates="document", uselist=False, cascade="all, delete-orphan"
     )
     owner: Mapped[User | None] = relationship(back_populates="documents")
+    ai_findings: Mapped[list["AIFinding"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan"
+    )
 
     def transition_to(self, new_status: DocumentStatus) -> None:
         allowed_transitions = {
@@ -198,3 +244,65 @@ class InvoiceLineItem(Base):
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     line_total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     invoice_extraction: Mapped[InvoiceExtraction] = relationship(back_populates="line_items")
+
+
+class AIFinding(Base):
+    __tablename__ = "ai_findings"
+    __table_args__ = (UniqueConstraint("document_id", "signature"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    category: Mapped[AIFindingCategory] = mapped_column(
+        Enum(
+            AIFindingCategory,
+            name="ai_finding_category",
+            values_callable=lambda categories: [category.value for category in categories],
+        ),
+        nullable=False,
+        index=True,
+    )
+    severity: Mapped[AIFindingSeverity] = mapped_column(
+        Enum(
+            AIFindingSeverity,
+            name="ai_finding_severity",
+            values_callable=lambda severities: [severity.value for severity in severities],
+        ),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[AIFindingStatus] = mapped_column(
+        Enum(
+            AIFindingStatus,
+            name="ai_finding_status",
+            values_callable=lambda statuses: [status.value for status in statuses],
+        ),
+        nullable=False,
+        default=AIFindingStatus.OPEN,
+        server_default=AIFindingStatus.OPEN.value,
+        index=True,
+    )
+    signature: Mapped[str] = mapped_column(String(160), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    affected_fields: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    confidence: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
+    observed_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    expected_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    document: Mapped[Document] = relationship(back_populates="ai_findings")

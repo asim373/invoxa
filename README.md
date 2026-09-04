@@ -1,4 +1,4 @@
-# Document & Invoice Analyzer
+# Invoxa — Document & Invoice Analyzer
 
 A privacy-first SaaS application for uploading business documents, extracting invoice
 data, reviewing results, and exporting structured records. The stack includes FastAPI,
@@ -14,6 +14,8 @@ React with TypeScript and Vite, PostgreSQL, Redis, and a resilient background wo
 - Reliable Redis queue processing, abandoned-job recovery, and queued-job reconciliation
 - Document preview, extracted text, processing states, reprocessing, and deletion
 - Individual and bulk CSV, XLSX, and JSON exports
+- Explainable AI Analysis findings with acknowledgement, resolution, and reopening
+- Ownership-scoped analytics, trends, and financial/AI/processing-quality reports
 - Health/readiness checks, structured logging, security headers, and rate limiting
 - Docker Compose services and automated CI regression checks
 
@@ -68,6 +70,29 @@ The API container applies migrations when it starts. To apply them explicitly:
 ```powershell
 docker compose run --rm api alembic upgrade head
 ```
+
+## AI Analysis and reports
+
+AI Analysis runs after extraction and validation complete. The document is committed as
+usable first; analysis then runs in a separate transaction so an analysis failure cannot
+erase OCR results or leave processing stuck. Findings are persisted and a stable signature
+makes re-analysis idempotent while preserving review state.
+
+The analysis combines existing deterministic financial validation with machine-assisted
+statistical detection. Amount anomalies use the median and median absolute deviation (MAD)
+within the same currency, requiring at least five prior invoices globally or four for the
+same vendor. Small samples produce no statistical anomaly claim. Duplicate analysis uses
+content hashes for exact file duplicates and multiple normalized invoice signals for probable
+duplicates. Missing fields, dates, extraction validation evidence, arithmetic, and tax
+consistency checks always include a human-readable reason; they do not claim fraud or legal
+tax compliance. No paid or external AI service is required, and invoice data is not sent to
+an AI provider.
+
+The Analytics view calculates KPIs and trends on the server and keeps currency totals
+separate. Reports provide financial summary, AI Analysis, and processing-quality data with
+CSV, XLSX, and JSON exports. PDF report export is intentionally deferred: the current stack
+has no PDF report renderer, and adding one solely for this phase would add disproportionate
+runtime and maintenance cost compared with the printable UI and spreadsheet exports.
 
 ## Production notes
 

@@ -1,6 +1,7 @@
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -40,11 +41,13 @@ class DocumentProcessingWorker:
         database: DocumentDatabase,
         pdf_extractor: DocumentTextExtractor | None = None,
         image_extractor: DocumentTextExtractor | None = None,
+        analyzer: Callable[[Any, Document], object] | None = None,
     ) -> None:
         self.queue = queue
         self.database = database
         self.pdf_extractor = pdf_extractor or PdfTextExtractor(self._default_ocr_extractor())
         self.image_extractor = image_extractor or self._default_ocr_extractor()
+        self.analyzer = analyzer
 
     def process_once(self) -> bool:
         payload = self.queue.acquire()
@@ -131,6 +134,31 @@ class DocumentProcessingWorker:
             logger.exception("document_processing_unexpected_failure document_id=%s", document_id)
             self._mark_failed(document, "Unexpected document processing failure.")
             return False
+
+        if self.analyzer is not None:
+            try:
+                self.analyzer(self.database, document)
+                self.database.commit()
+                logger.info("ai_analysis_completed document_id=%s", document_id)
+            except Exception:
+                self.database.rollback()
+                logger.exception("ai_analysis_failed document_id=%s", document_id)
+                try:
+                    from apps.api.app.models import AIAnalysisStatus
+
+                    document = self.database.get(Document, document_id)
+                    if document is not None:
+                        document.ai_analysis_status = AIAnalysisStatus.FAILED
+                        document.ai_analysis_error = (
+                            "AI Analysis could not be completed. "
+                            "The extracted document remains available."
+                        )
+                        self.database.commit()
+                except Exception:
+                    self.database.rollback()
+                    logger.exception(
+                        "ai_analysis_failure_state_unavailable document_id=%s", document_id
+                    )
 
         return True
 
@@ -245,6 +273,7 @@ def consume_document_job(worker: DocumentProcessingWorker) -> bool:
 if __name__ == "__main__":
     import time
 
+    from apps.api.app.ai_analysis import analyze_document
     from apps.api.app.database import SessionLocal
     from apps.api.app.logging import configure_logging
 
@@ -268,7 +297,7 @@ if __name__ == "__main__":
     while True:
         database = SessionLocal()
         try:
-            worker = DocumentProcessingWorker(queue, database)
+            worker = DocumentProcessingWorker(queue, database, analyzer=analyze_document)
             if (
                 time.monotonic() - last_reconciliation
                 >= settings.queue_reconciliation_interval_seconds

@@ -68,6 +68,52 @@ type PaginatedDocuments = {
   total_pages: number;
 };
 
+type AIFinding = {
+  id: string;
+  document_id: string;
+  document_filename: string;
+  invoice_number: string | null;
+  vendor_name: string | null;
+  category: string;
+  severity: "low" | "medium" | "high" | "critical";
+  status: "open" | "acknowledged" | "resolved";
+  title: string;
+  explanation: string;
+  evidence: Record<string, unknown>;
+  affected_fields: string[];
+  confidence: string | null;
+  observed_value: string | null;
+  expected_value: string | null;
+  created_at: string;
+};
+
+type CurrencyTotal = { currency: string; total: string; tax: string; average: string };
+type Analytics = {
+  kpis: {
+    total_documents: number;
+    completed_documents: number;
+    total_invoices: number;
+    currency_totals: CurrencyTotal[];
+    needs_review: number;
+    ai_findings: number;
+    unresolved_ai_findings: number;
+    high_severity_ai_findings: number;
+    validation_issue_count: number;
+  };
+  trends: {
+    invoice_spend: { period: string; currency: string; total: string }[];
+    invoice_count: { period: string; count: number }[];
+    top_vendors: { vendor: string; currency: string; total: string }[];
+    document_status: Record<string, number>;
+    validation_status: Record<string, number>;
+    findings_by_severity: Record<string, number>;
+    findings_over_time: Record<string, number>;
+  };
+};
+
+type ReportType = "financial" | "ai-analysis" | "processing-quality";
+type WorkspaceView = "overview" | "ai-analysis" | "reports" | "documents";
+
 type AuthMode = "login" | "register" | "forgot" | "reset";
 
 export const DOCUMENT_POLL_INTERVAL_MS = 1500;
@@ -135,6 +181,20 @@ export function App() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [exporting, setExporting] = useState<"csv" | "xlsx" | "json" | null>(null);
+  const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("documents");
+  const [analyticsRange, setAnalyticsRange] = useState("30d");
+  const [customStartDate, setCustomStartDate] = useState("");
+  const [customEndDate, setCustomEndDate] = useState("");
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [findings, setFindings] = useState<AIFinding[]>([]);
+  const [insightsLoading, setInsightsLoading] = useState(false);
+  const [insightsError, setInsightsError] = useState("");
+  const [findingSeverity, setFindingSeverity] = useState("");
+  const [findingStatus, setFindingStatus] = useState("open");
+  const [selectedFinding, setSelectedFinding] = useState<AIFinding | null>(null);
+  const [reportType, setReportType] = useState<ReportType>("financial");
+  const [report, setReport] = useState<Record<string, unknown> | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -544,13 +604,149 @@ export function App() {
     }
   }
 
+  async function loadAnalytics() {
+    if (analyticsRange === "custom" && (!customStartDate || !customEndDate)) {
+      setAnalytics(null);
+      setInsightsLoading(false);
+      setInsightsError("");
+      return;
+    }
+    setInsightsLoading(true);
+    setInsightsError("");
+    try {
+      const data = await apiRequest<Analytics>(`/analytics/summary?${insightsQuery()}`);
+      if (!data?.kpis || !data?.trends) throw new Error("Analytics response is incomplete.");
+      setAnalytics(data);
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationLostError) return;
+      setInsightsError(
+        requestError instanceof Error ? requestError.message : "Unable to load analytics.",
+      );
+    } finally {
+      setInsightsLoading(false);
+    }
+  }
+
+  function insightsQuery() {
+    const params = new URLSearchParams({ range: analyticsRange });
+    if (analyticsRange === "custom") {
+      if (customStartDate) params.set("start_date", customStartDate);
+      if (customEndDate) params.set("end_date", customEndDate);
+    }
+    return params.toString();
+  }
+
+  async function loadFindings() {
+    setInsightsLoading(true);
+    setInsightsError("");
+    try {
+      const params = new URLSearchParams({ page_size: "50" });
+      if (findingSeverity) params.set("severity", findingSeverity);
+      if (findingStatus) params.set("status", findingStatus);
+      const data = await apiRequest<{ items: AIFinding[] }>(
+        `/ai-analysis/findings?${params.toString()}`,
+      );
+      if (!Array.isArray(data?.items)) throw new Error("AI findings response is incomplete.");
+      setFindings(data.items);
+      setSelectedFinding((current) =>
+        current ? (data.items.find((finding) => finding.id === current.id) ?? null) : null,
+      );
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationLostError) return;
+      setInsightsError(
+        requestError instanceof Error ? requestError.message : "Unable to load AI findings.",
+      );
+    } finally {
+      setInsightsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!token || !user || workspaceView === "documents") return;
+    if (workspaceView === "overview") void loadAnalytics();
+    if (workspaceView === "ai-analysis") void loadFindings();
+  }, [
+    token,
+    user,
+    workspaceView,
+    analyticsRange,
+    customStartDate,
+    customEndDate,
+    findingSeverity,
+    findingStatus,
+  ]);
+
+  async function updateFindingStatus(
+    finding: AIFinding,
+    status: "open" | "acknowledged" | "resolved",
+  ) {
+    setInsightsError("");
+    try {
+      await apiRequest(`/ai-analysis/findings/${finding.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status }),
+      });
+      await loadFindings();
+      setSuccess(`AI finding marked ${status}.`);
+    } catch (requestError) {
+      setInsightsError(
+        requestError instanceof Error ? requestError.message : "Unable to update AI finding.",
+      );
+    }
+  }
+
+  async function generateReport() {
+    setReportLoading(true);
+    setInsightsError("");
+    try {
+      const data = await apiRequest<Record<string, unknown>>(
+        `/reports/${reportType}?${insightsQuery()}`,
+      );
+      setReport(data);
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationLostError) return;
+      setReport(null);
+      setInsightsError(
+        requestError instanceof Error ? requestError.message : "Unable to generate report.",
+      );
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  async function downloadReport(format: "csv" | "xlsx" | "json") {
+    setExporting(format);
+    setInsightsError("");
+    try {
+      const response = await authenticatedFetch(
+        `/reports/${reportType}/exports/${format}?${insightsQuery()}`,
+      );
+      if (!response.ok) throw new Error("Unable to export report.");
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      const disposition = response.headers.get("content-disposition") ?? "";
+      link.download = disposition.match(/filename="?([^";]+)"?/i)?.[1] ?? `invoxa-report.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (requestError) {
+      setInsightsError(
+        requestError instanceof Error ? requestError.message : "Unable to export report.",
+      );
+    } finally {
+      setExporting(null);
+    }
+  }
+
   if (!token || !user) {
     return (
       <main className="auth-page">
         <section className="auth-card">
-          <div className="brand-mark">DIA</div>
+          <div className="brand-mark">IX</div>
 
-          <p className="eyebrow">Document intelligence</p>
+          <p className="eyebrow">Invoxa</p>
 
           <h1>Document & Invoice Analyzer</h1>
 
@@ -715,7 +911,7 @@ export function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">Workspace</p>
-          <h1>Document & Invoice Analyzer</h1>
+          <h1>Invoxa</h1>
         </div>
 
         <div className="user-area">
@@ -748,494 +944,968 @@ export function App() {
           )}
         </div>
 
+        <nav className="workspace-nav" aria-label="Primary workspace">
+          {(["overview", "ai-analysis", "reports", "documents"] as WorkspaceView[]).map((view) => (
+            <button
+              className={workspaceView === view ? "active" : ""}
+              key={view}
+              onClick={() => {
+                setWorkspaceView(view);
+                setInsightsError("");
+              }}
+              type="button"
+            >
+              {view === "ai-analysis"
+                ? "AI Analysis"
+                : view.charAt(0).toUpperCase() + view.slice(1)}
+            </button>
+          ))}
+        </nav>
+
         {error && <div className="alert error">{error}</div>}
         {success && <div className="alert success">{success}</div>}
 
-        <div className="stats">
-          <div className="stat-card">
-            <span>Total documents</span>
-            <strong>{documentTotal}</strong>
-          </div>
-
-          <div className="stat-card">
-            <span>Processing on page</span>
-            <strong>
-              {
-                documents.filter(
-                  (document) => document.status === "queued" || document.status === "processing",
-                ).length
-              }
-            </strong>
-          </div>
-
-          <div className="stat-card">
-            <span>Completed on page</span>
-            <strong>
-              {documents.filter((document) => document.status === "completed").length}
-            </strong>
-          </div>
-
-          <div className="stat-card">
-            <span>Failed on page</span>
-            <strong>{documents.filter((document) => document.status === "failed").length}</strong>
-          </div>
-        </div>
-
-        <form
-          className="productivity-bar"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setPage(1);
-            setSearch(searchInput.trim());
-          }}
-        >
-          <label>
-            Search documents
-            <input
-              value={searchInput}
-              onChange={(event) => setSearchInput(event.target.value)}
-              placeholder="Filename, invoice, vendor, customer"
-            />
-          </label>
-          <label>
-            Status
-            <select
-              value={statusFilter}
-              onChange={(event) => {
-                setPage(1);
-                setStatusFilter(event.target.value);
-              }}
-            >
-              <option value="">All statuses</option>
-              <option value="queued">Queued</option>
-              <option value="processing">Processing</option>
-              <option value="completed">Completed</option>
-              <option value="failed">Failed</option>
-            </select>
-          </label>
-          <label>
-            File type
-            <select
-              value={mimeFilter}
-              onChange={(event) => {
-                setPage(1);
-                setMimeFilter(event.target.value);
-              }}
-            >
-              <option value="">All file types</option>
-              <option value="application/pdf">PDF</option>
-              <option value="image/jpeg">JPG/JPEG</option>
-              <option value="image/png">PNG</option>
-            </select>
-          </label>
-          <label>
-            Sort
-            <select
-              value={`${sortBy}:${sortDirection}`}
-              onChange={(event) => {
-                const [nextSort, nextDirection] = event.target.value.split(":");
-                setPage(1);
-                setSortBy(nextSort);
-                setSortDirection(nextDirection);
-              }}
-            >
-              <option value="created_at:desc">Newest</option>
-              <option value="created_at:asc">Oldest</option>
-              <option value="filename:asc">Filename A–Z</option>
-              <option value="filename:desc">Filename Z–A</option>
-              <option value="invoice_date:desc">Invoice date</option>
-            </select>
-          </label>
-          <button className="secondary-button" type="submit">
-            Search
-          </button>
-        </form>
-
-        <section className="workspace-grid">
-          <div className="documents-panel">
-            <div className="panel-header">
+        {workspaceView === "overview" && (
+          <section className="phase-panel" aria-labelledby="overview-heading">
+            <div className="phase-heading">
               <div>
-                <h3>Documents</h3>
-                <p>{documentTotal} stored files</p>
+                <p className="eyebrow">Executive summary</p>
+                <h2 id="overview-heading">Analytics overview</h2>
               </div>
-
-              <button
-                className="icon-button"
-                onClick={() => void loadDocuments()}
-                disabled={documentsLoading}
-                title="Refresh documents"
-              >
-                ↻
-              </button>
+              <label>
+                Time range
+                <select
+                  value={analyticsRange}
+                  onChange={(event) => setAnalyticsRange(event.target.value)}
+                >
+                  <option value="7d">Last 7 days</option>
+                  <option value="30d">Last 30 days</option>
+                  <option value="90d">Last 90 days</option>
+                  <option value="year">This year</option>
+                  <option value="custom">Custom range</option>
+                  <option value="all">All time</option>
+                </select>
+              </label>
+              {analyticsRange === "custom" && (
+                <div className="compact-filters custom-dates">
+                  <label>
+                    Start date
+                    <input
+                      type="date"
+                      value={customStartDate}
+                      onChange={(event) => setCustomStartDate(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    End date
+                    <input
+                      type="date"
+                      value={customEndDate}
+                      onChange={(event) => setCustomEndDate(event.target.value)}
+                    />
+                  </label>
+                </div>
+              )}
             </div>
-
-            <div className="bulk-actions" aria-label="Bulk export controls">
-              <span>{selectedDocumentIds.size} selected</span>
-              <button
-                className="secondary-button"
-                disabled={selectedDocumentIds.size === 0 || exporting !== null}
-                onClick={() => void downloadBulkExport("csv")}
-              >
-                CSV
-              </button>
-              <button
-                className="secondary-button"
-                disabled={selectedDocumentIds.size === 0 || exporting !== null}
-                onClick={() => void downloadBulkExport("xlsx")}
-              >
-                XLSX
-              </button>
-              <button
-                className="secondary-button"
-                disabled={selectedDocumentIds.size === 0 || exporting !== null}
-                onClick={() => void downloadBulkExport("json")}
-              >
-                JSON
-              </button>
-            </div>
-
-            {documentsLoading ? (
-              <div className="empty-state">Loading documents...</div>
-            ) : documents.length === 0 ? (
-              <div className="empty-state">
-                <strong>No documents yet.</strong>
-                <p>Upload your first PDF or image to begin.</p>
+            {insightsLoading ? (
+              <div className="compact-state" role="status">
+                Loading analytics...
               </div>
-            ) : (
-              <div className="document-list">
-                {documents.map((document) => (
-                  <article
-                    className={`document-row ${
-                      selectedDocument?.id === document.id ? "selected" : ""
-                    }`}
-                    key={document.id}
-                  >
-                    <label
-                      className="selection-control"
-                      aria-label={`Select ${document.original_filename}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedDocumentIds.has(document.id)}
-                        onChange={(event) =>
-                          setSelectedDocumentIds((current) => {
-                            const next = new Set(current);
-                            if (event.target.checked) next.add(document.id);
-                            else next.delete(document.id);
-                            return next;
-                          })
-                        }
-                      />
-                    </label>
-                    <button
-                      className="document-main"
-                      onClick={() => void openDocument(document.id)}
-                    >
-                      <div className="file-icon">
-                        {document.mime_type === "application/pdf" ? "PDF" : "IMG"}
-                      </div>
-
-                      <div className="document-info">
-                        <strong>{document.original_filename}</strong>
-                        <span>
-                          {formatFileSize(document.file_size)} · {formatDate(document.created_at)}
-                        </span>
-                      </div>
-
-                      <span className={`status ${document.status}`}>
-                        {statusLabel(document.status)}
-                      </span>
-                    </button>
-
-                    {canMutateDocuments && (
-                      <div className="row-actions">
-                        <button
-                          onClick={() => void reprocessDocument(document.id)}
-                          disabled={
-                            document.status === "queued" || document.status === "processing"
-                          }
-                        >
-                          Reprocess
-                        </button>
-
-                        <button
-                          className="danger-button"
-                          onClick={() => void deleteDocument(document.id)}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    )}
-                  </article>
-                ))}
+            ) : insightsError ? (
+              <div className="compact-state error-state">
+                <p>{insightsError}</p>
+                <button className="secondary-button" onClick={() => void loadAnalytics()}>
+                  Retry
+                </button>
               </div>
-            )}
-            <div className="pagination" aria-label="Document pages">
-              <button
-                className="secondary-button"
-                disabled={page <= 1 || documentsLoading}
-                onClick={() => setPage((current) => current - 1)}
-              >
-                Previous
-              </button>
-              <span>
-                Page {page} of {Math.max(totalPages, 1)}
-              </span>
-              <button
-                className="secondary-button"
-                disabled={page >= totalPages || documentsLoading}
-                onClick={() => setPage((current) => current + 1)}
-              >
-                Next
-              </button>
-            </div>
-          </div>
-
-          <aside className="details-panel">
-            {detailLoading && !selectedDocument ? (
-              <div className="details-empty" role="status">
-                Loading document details...
-              </div>
-            ) : !selectedDocument ? (
-              <div className="details-empty">
-                <div className="large-file-icon">⌁</div>
-                <h3>Select a document</h3>
-                <p>
-                  Choose a document from the list to inspect its extracted text and processing
-                  state.
-                </p>
-              </div>
+            ) : !analytics ? (
+              <div className="compact-state">Analytics are not available yet.</div>
             ) : (
               <>
-                <div className="panel-header">
-                  <div>
-                    <p className="eyebrow">Document detail</p>
-                    <h3>{selectedDocument.original_filename}</h3>
+                <div className="insight-kpis">
+                  <div className="stat-card">
+                    <span>Total invoices</span>
+                    <strong>{analytics.kpis.total_invoices}</strong>
                   </div>
-
-                  <span className={`status ${selectedDocument.status}`}>
-                    {statusLabel(selectedDocument.status)}
-                  </span>
-                </div>
-
-                <div className="detail-meta">
-                  <div>
-                    <span>File type</span>
-                    <strong>{selectedDocument.mime_type}</strong>
+                  <div className="stat-card">
+                    <span>Completed</span>
+                    <strong>{analytics.kpis.completed_documents}</strong>
                   </div>
-
-                  <div>
-                    <span>Size</span>
-                    <strong>{formatFileSize(selectedDocument.file_size)}</strong>
+                  <div className="stat-card">
+                    <span>Needs review</span>
+                    <strong>{analytics.kpis.needs_review}</strong>
                   </div>
-
-                  <div>
-                    <span>Created</span>
-                    <strong>{formatDate(selectedDocument.created_at)}</strong>
+                  <div className="stat-card">
+                    <span>Open AI findings</span>
+                    <strong>{analytics.kpis.unresolved_ai_findings}</strong>
+                  </div>
+                  <div className="stat-card">
+                    <span>High-risk findings</span>
+                    <strong>{analytics.kpis.high_severity_ai_findings}</strong>
                   </div>
                 </div>
-
-                <div className="detail-actions">
-                  <button
-                    className="secondary-button"
-                    onClick={() => void downloadExport(selectedDocument.id, "csv")}
-                    disabled={selectedDocument.status !== "completed" || exporting !== null}
-                  >
-                    {exporting === "csv" ? "Exporting..." : "Export CSV"}
-                  </button>
-
-                  <button
-                    className="secondary-button"
-                    onClick={() => void downloadExport(selectedDocument.id, "xlsx")}
-                    disabled={selectedDocument.status !== "completed" || exporting !== null}
-                  >
-                    {exporting === "xlsx" ? "Exporting..." : "Export XLSX"}
-                  </button>
-                  <button
-                    className="secondary-button"
-                    onClick={() => void downloadExport(selectedDocument.id, "json")}
-                    disabled={selectedDocument.status !== "completed" || exporting !== null}
-                  >
-                    {exporting === "json" ? "Exporting..." : "Export JSON"}
-                  </button>
-                </div>
-
-                <section className="preview-section" aria-labelledby="preview-heading">
-                  <div className="section-heading">
-                    <h4 id="preview-heading">Original document</h4>
+                {analytics.kpis.currency_totals.length ? (
+                  <div className="currency-strip" aria-label="Invoice values by currency">
+                    {analytics.kpis.currency_totals.map((item) => (
+                      <div key={item.currency}>
+                        <span>{item.currency} total</span>
+                        <strong>{formatMoney(item.total, item.currency)}</strong>
+                        <small>
+                          Average {formatMoney(item.average, item.currency)} · Tax{" "}
+                          {formatMoney(item.tax, item.currency)}
+                        </small>
+                      </div>
+                    ))}
                   </div>
-                  {previewLoading ? (
-                    <div className="compact-state" role="status">
-                      Loading secure preview...
-                    </div>
-                  ) : previewError ? (
-                    <div className="compact-state error-state">
-                      <p>{previewError}</p>
-                      <button
-                        className="secondary-button"
-                        onClick={() => void loadPreview(selectedDocument.id)}
-                      >
-                        Retry preview
-                      </button>
-                    </div>
-                  ) : selectedDocument.mime_type === "application/pdf" && previewUrl ? (
-                    <iframe
-                      className="document-preview"
-                      src={previewUrl}
-                      title={`Preview of ${selectedDocument.original_filename}`}
-                    />
-                  ) : selectedDocument.mime_type.startsWith("image/") && previewUrl ? (
-                    <div className="image-preview-wrap">
-                      <img
-                        className="image-preview"
-                        src={previewUrl}
-                        alt={`Preview of ${selectedDocument.original_filename}`}
-                      />
-                    </div>
-                  ) : (
-                    <div className="compact-state">Preview is unavailable for this file type.</div>
-                  )}
-                </section>
-
-                <section className="invoice-section" aria-labelledby="invoice-heading">
-                  <div className="section-heading">
-                    <h4 id="invoice-heading">Invoice results</h4>
-                    {selectedDocument.invoice_extraction && (
-                      <span
-                        className={`validation ${selectedDocument.invoice_extraction.is_valid ? "valid" : "invalid"}`}
-                      >
-                        {selectedDocument.invoice_extraction.is_valid
-                          ? "Validated"
-                          : "Needs review"}
-                      </span>
+                ) : (
+                  <div className="compact-state">No invoice values in this period.</div>
+                )}
+                <div className="analytics-grid">
+                  <article className="chart-card">
+                    <h3>Invoice count over time</h3>
+                    {analytics.trends.invoice_count.length ? (
+                      analytics.trends.invoice_count.map((point) => (
+                        <div
+                          className="bar-row"
+                          key={point.period}
+                          aria-label={`${point.period}: ${point.count} invoices`}
+                        >
+                          <span>{point.period}</span>
+                          <div>
+                            <i
+                              style={{ width: `${Math.max(4, Math.min(100, point.count * 10))}%` }}
+                            />
+                          </div>
+                          <strong>{point.count}</strong>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="muted-copy">No invoices in this period.</p>
                     )}
-                  </div>
-                  {selectedDocument.invoice_extraction ? (
-                    <>
-                      {selectedDocument.invoice_extraction.validation_error && (
-                        <div className="inline-warning">
-                          {selectedDocument.invoice_extraction.validation_error}
+                  </article>
+                  <article className="chart-card">
+                    <h3>Top vendors</h3>
+                    {analytics.trends.top_vendors.length ? (
+                      analytics.trends.top_vendors.slice(0, 6).map((vendor) => (
+                        <div className="vendor-row" key={`${vendor.vendor}-${vendor.currency}`}>
+                          <span title={vendor.vendor}>{vendor.vendor}</span>
+                          <strong>{formatMoney(vendor.total, vendor.currency)}</strong>
                         </div>
-                      )}
-                      <dl className="invoice-fields">
-                        <div>
-                          <dt>Invoice number</dt>
-                          <dd>
-                            {displayValue(selectedDocument.invoice_extraction.invoice_number)}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Invoice date</dt>
-                          <dd>{displayValue(selectedDocument.invoice_extraction.invoice_date)}</dd>
-                        </div>
-                        <div>
-                          <dt>Vendor</dt>
-                          <dd>{displayValue(selectedDocument.invoice_extraction.vendor_name)}</dd>
-                        </div>
-                        <div>
-                          <dt>Customer</dt>
-                          <dd>{displayValue(selectedDocument.invoice_extraction.customer_name)}</dd>
-                        </div>
-                        <div>
-                          <dt>Subtotal</dt>
-                          <dd>
-                            {formatMoney(
-                              selectedDocument.invoice_extraction.subtotal,
-                              selectedDocument.invoice_extraction.currency,
-                            )}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt>Tax</dt>
-                          <dd>
-                            {formatMoney(
-                              selectedDocument.invoice_extraction.tax,
-                              selectedDocument.invoice_extraction.currency,
-                            )}
-                          </dd>
-                        </div>
-                        <div className="total-field">
-                          <dt>Total</dt>
-                          <dd>
-                            {formatMoney(
-                              selectedDocument.invoice_extraction.total,
-                              selectedDocument.invoice_extraction.currency,
-                            )}
-                          </dd>
-                        </div>
-                      </dl>
-                      {selectedDocument.invoice_extraction.line_items.length > 0 ? (
-                        <div className="table-scroll" tabIndex={0} aria-label="Invoice line items">
-                          <table>
-                            <thead>
-                              <tr>
-                                <th>Description</th>
-                                <th>Qty</th>
-                                <th>Unit price</th>
-                                <th>Total</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {selectedDocument.invoice_extraction.line_items.map((item) => (
-                                <tr key={item.position}>
-                                  <td>{item.description}</td>
-                                  <td>{item.quantity}</td>
-                                  <td>
-                                    {formatMoney(
-                                      item.unit_price,
-                                      selectedDocument.invoice_extraction?.currency ?? null,
-                                    )}
-                                  </td>
-                                  <td>
-                                    {formatMoney(
-                                      item.line_total,
-                                      selectedDocument.invoice_extraction?.currency ?? null,
-                                    )}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      ) : (
-                        <p className="muted-copy">No line items were extracted.</p>
-                      )}
-                    </>
-                  ) : (
-                    <div className="compact-state">
-                      No structured invoice fields were extracted.
-                    </div>
-                  )}
-                </section>
-
-                <section className="extracted-section">
-                  <div className="section-heading">
-                    <h4>Extracted text</h4>
-                  </div>
-
-                  {selectedDocument.extracted_text ? (
-                    <pre>{selectedDocument.extracted_text}</pre>
-                  ) : selectedDocument.status === "failed" ? (
-                    <div className="empty-state">
-                      <strong>Processing failed.</strong>
-                      <p>
-                        {selectedDocument.error_details ||
-                          "The processor did not provide an error detail."}
+                      ))
+                    ) : (
+                      <p className="muted-copy">
+                        Vendor spend will appear when invoices are available.
                       </p>
-                    </div>
-                  ) : (
-                    <div className="empty-state">
-                      <strong>No extracted text yet.</strong>
-                      <p>
-                        The document must finish processing before extracted content is available.
-                      </p>
-                    </div>
-                  )}
-                </section>
+                    )}
+                  </article>
+                  <article className="chart-card">
+                    <h3>AI findings by severity</h3>
+                    {Object.entries(analytics.trends.findings_by_severity).map(
+                      ([severity, count]) => (
+                        <div className="vendor-row" key={severity}>
+                          <span className={`finding-badge ${severity}`}>{severity}</span>
+                          <strong>{count}</strong>
+                        </div>
+                      ),
+                    )}
+                    {!Object.keys(analytics.trends.findings_by_severity).length && (
+                      <p className="muted-copy">No AI findings in this period.</p>
+                    )}
+                  </article>
+                </div>
               </>
             )}
-          </aside>
-        </section>
+          </section>
+        )}
+
+        {workspaceView === "ai-analysis" && (
+          <section className="phase-panel" aria-labelledby="ai-heading">
+            <div className="phase-heading">
+              <div>
+                <p className="eyebrow">Review attention</p>
+                <h2 id="ai-heading">AI Analysis</h2>
+                <p>Statistical and machine-assisted checks with transparent evidence.</p>
+              </div>
+              <div className="compact-filters">
+                <label>
+                  Severity
+                  <select
+                    aria-label="AI severity"
+                    value={findingSeverity}
+                    onChange={(event) => setFindingSeverity(event.target.value)}
+                  >
+                    <option value="">All</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+                <label>
+                  Status
+                  <select
+                    aria-label="AI finding status"
+                    value={findingStatus}
+                    onChange={(event) => setFindingStatus(event.target.value)}
+                  >
+                    <option value="">All</option>
+                    <option value="open">Open</option>
+                    <option value="acknowledged">Acknowledged</option>
+                    <option value="resolved">Resolved</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            {insightsLoading ? (
+              <div className="compact-state" role="status">
+                Loading AI findings...
+              </div>
+            ) : insightsError ? (
+              <div className="compact-state error-state">
+                <p>{insightsError}</p>
+                <button className="secondary-button" onClick={() => void loadFindings()}>
+                  Retry
+                </button>
+              </div>
+            ) : findings.length === 0 ? (
+              <div className="compact-state">
+                <strong>No findings match these filters.</strong>
+                <p>Completed documents remain available in Documents.</p>
+              </div>
+            ) : (
+              <div className="findings-layout">
+                <div className="table-scroll" tabIndex={0} aria-label="AI findings">
+                  <table className="findings-table">
+                    <thead>
+                      <tr>
+                        <th>Severity</th>
+                        <th>Finding</th>
+                        <th>Document</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {findings.map((finding) => (
+                        <tr
+                          key={finding.id}
+                          onClick={() => setSelectedFinding(finding)}
+                          className={selectedFinding?.id === finding.id ? "selected" : ""}
+                        >
+                          <td>
+                            <span className={`finding-badge ${finding.severity}`}>
+                              {finding.severity}
+                            </span>
+                          </td>
+                          <td>
+                            <button
+                              className="table-link"
+                              type="button"
+                              onClick={() => setSelectedFinding(finding)}
+                            >
+                              {finding.title}
+                            </button>
+                            <small>{finding.category.replaceAll("_", " ")}</small>
+                          </td>
+                          <td title={finding.document_filename}>{finding.document_filename}</td>
+                          <td>
+                            <span className="finding-status">{finding.status}</span>
+                          </td>
+                          <td>{formatDate(finding.created_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <aside className="finding-detail" aria-label="AI finding detail">
+                  {!selectedFinding ? (
+                    <div className="compact-state">Select a finding to inspect its evidence.</div>
+                  ) : (
+                    <>
+                      <div>
+                        <span className={`finding-badge ${selectedFinding.severity}`}>
+                          {selectedFinding.severity}
+                        </span>
+                        <span className="finding-status">{selectedFinding.status}</span>
+                      </div>
+                      <h3>{selectedFinding.title}</h3>
+                      <p>{selectedFinding.explanation}</p>
+                      {(selectedFinding.observed_value || selectedFinding.expected_value) && (
+                        <dl className="evidence-grid">
+                          <div>
+                            <dt>Observed</dt>
+                            <dd>{selectedFinding.observed_value ?? "—"}</dd>
+                          </div>
+                          <div>
+                            <dt>Expected</dt>
+                            <dd>{selectedFinding.expected_value ?? "—"}</dd>
+                          </div>
+                        </dl>
+                      )}
+                      {selectedFinding.confidence && (
+                        <p className="muted-copy">
+                          Signal confidence: {(Number(selectedFinding.confidence) * 100).toFixed(0)}
+                          %
+                        </p>
+                      )}
+                      {selectedFinding.affected_fields.length > 0 && (
+                        <p className="muted-copy">
+                          Affected fields: {selectedFinding.affected_fields.join(", ")}
+                        </p>
+                      )}
+                      {Object.keys(selectedFinding.evidence).length > 0 && (
+                        <details className="finding-evidence">
+                          <summary>Supporting evidence</summary>
+                          <pre>{JSON.stringify(selectedFinding.evidence, null, 2)}</pre>
+                        </details>
+                      )}
+                      <div className="detail-actions">
+                        <button
+                          className="secondary-button"
+                          onClick={() => {
+                            setWorkspaceView("documents");
+                            void openDocument(selectedFinding.document_id);
+                          }}
+                        >
+                          Open source document
+                        </button>
+                        {canMutateDocuments && selectedFinding.status === "open" && (
+                          <button
+                            className="secondary-button"
+                            onClick={() =>
+                              void updateFindingStatus(selectedFinding, "acknowledged")
+                            }
+                          >
+                            Acknowledge
+                          </button>
+                        )}
+                        {canMutateDocuments && selectedFinding.status !== "resolved" && (
+                          <button
+                            className="primary-button"
+                            onClick={() => void updateFindingStatus(selectedFinding, "resolved")}
+                          >
+                            Resolve
+                          </button>
+                        )}
+                        {canMutateDocuments && selectedFinding.status === "resolved" && (
+                          <button
+                            className="secondary-button"
+                            onClick={() => void updateFindingStatus(selectedFinding, "open")}
+                          >
+                            Reopen
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </aside>
+              </div>
+            )}
+          </section>
+        )}
+
+        {workspaceView === "reports" && (
+          <section className="phase-panel" aria-labelledby="reports-heading">
+            <div className="phase-heading">
+              <div>
+                <p className="eyebrow">Server-generated data</p>
+                <h2 id="reports-heading">Reports</h2>
+                <p>Generate filtered, ownership-scoped operational reports.</p>
+              </div>
+            </div>
+            <div className="report-controls">
+              <label>
+                Report type
+                <select
+                  value={reportType}
+                  onChange={(event) => {
+                    setReportType(event.target.value as ReportType);
+                    setReport(null);
+                  }}
+                >
+                  <option value="financial">Financial summary</option>
+                  <option value="ai-analysis">AI Analysis</option>
+                  <option value="processing-quality">Processing quality</option>
+                </select>
+              </label>
+              <label>
+                Time range
+                <select
+                  value={analyticsRange}
+                  onChange={(event) => {
+                    setAnalyticsRange(event.target.value);
+                    setReport(null);
+                  }}
+                >
+                  <option value="7d">Last 7 days</option>
+                  <option value="30d">Last 30 days</option>
+                  <option value="90d">Last 90 days</option>
+                  <option value="year">This year</option>
+                  <option value="custom">Custom range</option>
+                  <option value="all">All time</option>
+                </select>
+              </label>
+              {analyticsRange === "custom" && (
+                <>
+                  <label>
+                    Start date
+                    <input
+                      type="date"
+                      value={customStartDate}
+                      onChange={(event) => {
+                        setCustomStartDate(event.target.value);
+                        setReport(null);
+                      }}
+                    />
+                  </label>
+                  <label>
+                    End date
+                    <input
+                      type="date"
+                      value={customEndDate}
+                      onChange={(event) => {
+                        setCustomEndDate(event.target.value);
+                        setReport(null);
+                      }}
+                    />
+                  </label>
+                </>
+              )}
+              <button
+                className="primary-button"
+                disabled={
+                  reportLoading ||
+                  (analyticsRange === "custom" && (!customStartDate || !customEndDate))
+                }
+                onClick={() => void generateReport()}
+              >
+                {reportLoading ? "Generating..." : "Generate report"}
+              </button>
+            </div>
+            {insightsError && <div className="alert error">{insightsError}</div>}
+            {report ? (
+              <div className="report-preview">
+                <div className="phase-heading">
+                  <h3>Report preview</h3>
+                  <div className="detail-actions">
+                    {(["csv", "xlsx", "json"] as const).map((format) => (
+                      <button
+                        className="secondary-button"
+                        disabled={exporting !== null}
+                        key={format}
+                        onClick={() => void downloadReport(format)}
+                      >
+                        Export {format.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <pre>{JSON.stringify(report, null, 2)}</pre>
+              </div>
+            ) : (
+              !reportLoading && (
+                <div className="compact-state">Choose a report and generate a current preview.</div>
+              )
+            )}
+          </section>
+        )}
+
+        <div className={workspaceView === "documents" ? "" : "view-hidden"}>
+          <div className="stats">
+            <div className="stat-card">
+              <span>Total documents</span>
+              <strong>{documentTotal}</strong>
+            </div>
+
+            <div className="stat-card">
+              <span>Processing on page</span>
+              <strong>
+                {
+                  documents.filter(
+                    (document) => document.status === "queued" || document.status === "processing",
+                  ).length
+                }
+              </strong>
+            </div>
+
+            <div className="stat-card">
+              <span>Completed on page</span>
+              <strong>
+                {documents.filter((document) => document.status === "completed").length}
+              </strong>
+            </div>
+
+            <div className="stat-card">
+              <span>Failed on page</span>
+              <strong>{documents.filter((document) => document.status === "failed").length}</strong>
+            </div>
+          </div>
+
+          <form
+            className="productivity-bar"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setPage(1);
+              setSearch(searchInput.trim());
+            }}
+          >
+            <label>
+              Search documents
+              <input
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="Filename, invoice, vendor, customer"
+              />
+            </label>
+            <label>
+              Status
+              <select
+                value={statusFilter}
+                onChange={(event) => {
+                  setPage(1);
+                  setStatusFilter(event.target.value);
+                }}
+              >
+                <option value="">All statuses</option>
+                <option value="queued">Queued</option>
+                <option value="processing">Processing</option>
+                <option value="completed">Completed</option>
+                <option value="failed">Failed</option>
+              </select>
+            </label>
+            <label>
+              File type
+              <select
+                value={mimeFilter}
+                onChange={(event) => {
+                  setPage(1);
+                  setMimeFilter(event.target.value);
+                }}
+              >
+                <option value="">All file types</option>
+                <option value="application/pdf">PDF</option>
+                <option value="image/jpeg">JPG/JPEG</option>
+                <option value="image/png">PNG</option>
+              </select>
+            </label>
+            <label>
+              Sort
+              <select
+                value={`${sortBy}:${sortDirection}`}
+                onChange={(event) => {
+                  const [nextSort, nextDirection] = event.target.value.split(":");
+                  setPage(1);
+                  setSortBy(nextSort);
+                  setSortDirection(nextDirection);
+                }}
+              >
+                <option value="created_at:desc">Newest</option>
+                <option value="created_at:asc">Oldest</option>
+                <option value="filename:asc">Filename A–Z</option>
+                <option value="filename:desc">Filename Z–A</option>
+                <option value="invoice_date:desc">Invoice date</option>
+              </select>
+            </label>
+            <button className="secondary-button" type="submit">
+              Search
+            </button>
+          </form>
+
+          <section className="workspace-grid">
+            <div className="documents-panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Documents</h3>
+                  <p>{documentTotal} stored files</p>
+                </div>
+
+                <button
+                  className="icon-button"
+                  onClick={() => void loadDocuments()}
+                  disabled={documentsLoading}
+                  title="Refresh documents"
+                >
+                  ↻
+                </button>
+              </div>
+
+              <div className="bulk-actions" aria-label="Bulk export controls">
+                <span>{selectedDocumentIds.size} selected</span>
+                <button
+                  className="secondary-button"
+                  disabled={selectedDocumentIds.size === 0 || exporting !== null}
+                  onClick={() => void downloadBulkExport("csv")}
+                >
+                  CSV
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={selectedDocumentIds.size === 0 || exporting !== null}
+                  onClick={() => void downloadBulkExport("xlsx")}
+                >
+                  XLSX
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={selectedDocumentIds.size === 0 || exporting !== null}
+                  onClick={() => void downloadBulkExport("json")}
+                >
+                  JSON
+                </button>
+              </div>
+
+              {documentsLoading ? (
+                <div className="empty-state">Loading documents...</div>
+              ) : documents.length === 0 ? (
+                <div className="empty-state">
+                  <strong>No documents yet.</strong>
+                  <p>Upload your first PDF or image to begin.</p>
+                </div>
+              ) : (
+                <div className="document-list">
+                  {documents.map((document) => (
+                    <article
+                      className={`document-row ${
+                        selectedDocument?.id === document.id ? "selected" : ""
+                      }`}
+                      key={document.id}
+                    >
+                      <label
+                        className="selection-control"
+                        aria-label={`Select ${document.original_filename}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedDocumentIds.has(document.id)}
+                          onChange={(event) =>
+                            setSelectedDocumentIds((current) => {
+                              const next = new Set(current);
+                              if (event.target.checked) next.add(document.id);
+                              else next.delete(document.id);
+                              return next;
+                            })
+                          }
+                        />
+                      </label>
+                      <button
+                        className="document-main"
+                        onClick={() => void openDocument(document.id)}
+                      >
+                        <div className="file-icon">
+                          {document.mime_type === "application/pdf" ? "PDF" : "IMG"}
+                        </div>
+
+                        <div className="document-info">
+                          <strong>{document.original_filename}</strong>
+                          <span>
+                            {formatFileSize(document.file_size)} · {formatDate(document.created_at)}
+                          </span>
+                        </div>
+
+                        <span className={`status ${document.status}`}>
+                          {statusLabel(document.status)}
+                        </span>
+                      </button>
+
+                      {canMutateDocuments && (
+                        <div className="row-actions">
+                          <button
+                            onClick={() => void reprocessDocument(document.id)}
+                            disabled={
+                              document.status === "queued" || document.status === "processing"
+                            }
+                          >
+                            Reprocess
+                          </button>
+
+                          <button
+                            className="danger-button"
+                            onClick={() => void deleteDocument(document.id)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+              <div className="pagination" aria-label="Document pages">
+                <button
+                  className="secondary-button"
+                  disabled={page <= 1 || documentsLoading}
+                  onClick={() => setPage((current) => current - 1)}
+                >
+                  Previous
+                </button>
+                <span>
+                  Page {page} of {Math.max(totalPages, 1)}
+                </span>
+                <button
+                  className="secondary-button"
+                  disabled={page >= totalPages || documentsLoading}
+                  onClick={() => setPage((current) => current + 1)}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+
+            <aside className="details-panel">
+              {detailLoading && !selectedDocument ? (
+                <div className="details-empty" role="status">
+                  Loading document details...
+                </div>
+              ) : !selectedDocument ? (
+                <div className="details-empty">
+                  <div className="large-file-icon">⌁</div>
+                  <h3>Select a document</h3>
+                  <p>
+                    Choose a document from the list to inspect its extracted text and processing
+                    state.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="panel-header">
+                    <div>
+                      <p className="eyebrow">Document detail</p>
+                      <h3>{selectedDocument.original_filename}</h3>
+                    </div>
+
+                    <span className={`status ${selectedDocument.status}`}>
+                      {statusLabel(selectedDocument.status)}
+                    </span>
+                  </div>
+
+                  <div className="detail-meta">
+                    <div>
+                      <span>File type</span>
+                      <strong>{selectedDocument.mime_type}</strong>
+                    </div>
+
+                    <div>
+                      <span>Size</span>
+                      <strong>{formatFileSize(selectedDocument.file_size)}</strong>
+                    </div>
+
+                    <div>
+                      <span>Created</span>
+                      <strong>{formatDate(selectedDocument.created_at)}</strong>
+                    </div>
+                  </div>
+
+                  <div className="detail-actions">
+                    <button
+                      className="secondary-button"
+                      onClick={() => void downloadExport(selectedDocument.id, "csv")}
+                      disabled={selectedDocument.status !== "completed" || exporting !== null}
+                    >
+                      {exporting === "csv" ? "Exporting..." : "Export CSV"}
+                    </button>
+
+                    <button
+                      className="secondary-button"
+                      onClick={() => void downloadExport(selectedDocument.id, "xlsx")}
+                      disabled={selectedDocument.status !== "completed" || exporting !== null}
+                    >
+                      {exporting === "xlsx" ? "Exporting..." : "Export XLSX"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      onClick={() => void downloadExport(selectedDocument.id, "json")}
+                      disabled={selectedDocument.status !== "completed" || exporting !== null}
+                    >
+                      {exporting === "json" ? "Exporting..." : "Export JSON"}
+                    </button>
+                  </div>
+
+                  <section className="preview-section" aria-labelledby="preview-heading">
+                    <div className="section-heading">
+                      <h4 id="preview-heading">Original document</h4>
+                    </div>
+                    {previewLoading ? (
+                      <div className="compact-state" role="status">
+                        Loading secure preview...
+                      </div>
+                    ) : previewError ? (
+                      <div className="compact-state error-state">
+                        <p>{previewError}</p>
+                        <button
+                          className="secondary-button"
+                          onClick={() => void loadPreview(selectedDocument.id)}
+                        >
+                          Retry preview
+                        </button>
+                      </div>
+                    ) : selectedDocument.mime_type === "application/pdf" && previewUrl ? (
+                      <iframe
+                        className="document-preview"
+                        src={previewUrl}
+                        title={`Preview of ${selectedDocument.original_filename}`}
+                      />
+                    ) : selectedDocument.mime_type.startsWith("image/") && previewUrl ? (
+                      <div className="image-preview-wrap">
+                        <img
+                          className="image-preview"
+                          src={previewUrl}
+                          alt={`Preview of ${selectedDocument.original_filename}`}
+                        />
+                      </div>
+                    ) : (
+                      <div className="compact-state">
+                        Preview is unavailable for this file type.
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="invoice-section" aria-labelledby="invoice-heading">
+                    <div className="section-heading">
+                      <h4 id="invoice-heading">Invoice results</h4>
+                      {selectedDocument.invoice_extraction && (
+                        <span
+                          className={`validation ${selectedDocument.invoice_extraction.is_valid ? "valid" : "invalid"}`}
+                        >
+                          {selectedDocument.invoice_extraction.is_valid
+                            ? "Validated"
+                            : "Needs review"}
+                        </span>
+                      )}
+                    </div>
+                    {selectedDocument.invoice_extraction ? (
+                      <>
+                        {selectedDocument.invoice_extraction.validation_error && (
+                          <div className="inline-warning">
+                            {selectedDocument.invoice_extraction.validation_error}
+                          </div>
+                        )}
+                        <dl className="invoice-fields">
+                          <div>
+                            <dt>Invoice number</dt>
+                            <dd>
+                              {displayValue(selectedDocument.invoice_extraction.invoice_number)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Invoice date</dt>
+                            <dd>
+                              {displayValue(selectedDocument.invoice_extraction.invoice_date)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Vendor</dt>
+                            <dd>{displayValue(selectedDocument.invoice_extraction.vendor_name)}</dd>
+                          </div>
+                          <div>
+                            <dt>Customer</dt>
+                            <dd>
+                              {displayValue(selectedDocument.invoice_extraction.customer_name)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Subtotal</dt>
+                            <dd>
+                              {formatMoney(
+                                selectedDocument.invoice_extraction.subtotal,
+                                selectedDocument.invoice_extraction.currency,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Tax</dt>
+                            <dd>
+                              {formatMoney(
+                                selectedDocument.invoice_extraction.tax,
+                                selectedDocument.invoice_extraction.currency,
+                              )}
+                            </dd>
+                          </div>
+                          <div className="total-field">
+                            <dt>Total</dt>
+                            <dd>
+                              {formatMoney(
+                                selectedDocument.invoice_extraction.total,
+                                selectedDocument.invoice_extraction.currency,
+                              )}
+                            </dd>
+                          </div>
+                        </dl>
+                        {selectedDocument.invoice_extraction.line_items.length > 0 ? (
+                          <div
+                            className="table-scroll"
+                            tabIndex={0}
+                            aria-label="Invoice line items"
+                          >
+                            <table>
+                              <thead>
+                                <tr>
+                                  <th>Description</th>
+                                  <th>Qty</th>
+                                  <th>Unit price</th>
+                                  <th>Total</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {selectedDocument.invoice_extraction.line_items.map((item) => (
+                                  <tr key={item.position}>
+                                    <td>{item.description}</td>
+                                    <td>{item.quantity}</td>
+                                    <td>
+                                      {formatMoney(
+                                        item.unit_price,
+                                        selectedDocument.invoice_extraction?.currency ?? null,
+                                      )}
+                                    </td>
+                                    <td>
+                                      {formatMoney(
+                                        item.line_total,
+                                        selectedDocument.invoice_extraction?.currency ?? null,
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <p className="muted-copy">No line items were extracted.</p>
+                        )}
+                      </>
+                    ) : (
+                      <div className="compact-state">
+                        No structured invoice fields were extracted.
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="extracted-section">
+                    <div className="section-heading">
+                      <h4>Extracted text</h4>
+                    </div>
+
+                    {selectedDocument.extracted_text ? (
+                      <pre>{selectedDocument.extracted_text}</pre>
+                    ) : selectedDocument.status === "failed" ? (
+                      <div className="empty-state">
+                        <strong>Processing failed.</strong>
+                        <p>
+                          {selectedDocument.error_details ||
+                            "The processor did not provide an error detail."}
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="empty-state">
+                        <strong>No extracted text yet.</strong>
+                        <p>
+                          The document must finish processing before extracted content is available.
+                        </p>
+                      </div>
+                    )}
+                  </section>
+                </>
+              )}
+            </aside>
+          </section>
+        </div>
       </section>
     </main>
   );

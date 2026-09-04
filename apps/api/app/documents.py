@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 from apps.api.app.auth import get_current_editor, get_current_user
 from apps.api.app.database import get_db
 from apps.api.app.models import (
+    AIAnalysisStatus,
     Document,
     DocumentStatus,
     InvalidDocumentStatusTransition,
@@ -82,6 +83,7 @@ class DocumentListItemResponse(BaseModel):
     mime_type: str
     file_size: int
     status: DocumentStatus
+    ai_analysis_status: AIAnalysisStatus | None = AIAnalysisStatus.PENDING
     created_at: datetime
     updated_at: datetime
 
@@ -128,6 +130,9 @@ class DocumentDetailResponse(BaseModel):
     mime_type: str
     file_size: int
     status: DocumentStatus
+    ai_analysis_status: AIAnalysisStatus | None = AIAnalysisStatus.PENDING
+    ai_analysis_error: str | None
+    ai_analyzed_at: datetime | None
     extracted_text: str | None
     error_details: str | None
     invoice_extraction: InvoiceExtractionResponse | None
@@ -457,6 +462,8 @@ def reprocess_document(
     previous_status = document.status
     try:
         document.transition_to(DocumentStatus.QUEUED)
+        document.ai_analysis_status = AIAnalysisStatus.PENDING
+        document.ai_analysis_error = None
         _commit_queued_then_publish(document, database, queue)
     except InvalidDocumentStatusTransition:
         raise HTTPException(

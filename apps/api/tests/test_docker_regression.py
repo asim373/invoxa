@@ -63,7 +63,7 @@ def _pdf_bytes() -> bytes:
 def _client() -> Iterator[httpx.Client]:
     email = f"docker-regression-{uuid.uuid4()}@example.com"
     credentials = {"email": email, "password": "DockerRegression123!"}
-    with httpx.Client(base_url=API_URL, timeout=15) as client:
+    with httpx.Client(base_url=API_URL, timeout=15, headers={"Host": "localhost"}) as client:
         assert client.post("/auth/register", json=credentials).status_code == 201
         token = (
             client.post("/auth/login", json=credentials).raise_for_status().json()["access_token"]
@@ -139,4 +139,46 @@ def test_cross_user_document_isolation_and_owner_workflow() -> None:
         other_documents = other_user.get("/documents").raise_for_status().json()["items"]
         listed_ids = {item["id"] for item in other_documents}
         assert document_id not in listed_ids
+
+        deadline = time.monotonic() + 15
+        analysis: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            response = owner.get(f"/documents/{document_id}/ai-analysis")
+            response.raise_for_status()
+            analysis = response.json()
+            if analysis["analysis_status"] == "completed":
+                break
+            time.sleep(0.1)
+        assert analysis["analysis_status"] == "completed"
+        findings = analysis["findings"]
+        assert isinstance(findings, list) and findings
+        finding = findings[0]
+        assert finding["explanation"]
+
+        reviewed = owner.patch(
+            f"/ai-analysis/findings/{finding['id']}", json={"status": "acknowledged"}
+        )
+        reviewed.raise_for_status()
+        assert reviewed.json()["status"] == "acknowledged"
+
+        analytics = owner.get("/analytics/summary?range=all").raise_for_status().json()
+        assert analytics["kpis"]["total_documents"] >= 1
+        assert analytics["kpis"]["ai_findings"] >= 1
+        for report_type in ("financial", "ai-analysis", "processing-quality"):
+            assert owner.get(f"/reports/{report_type}?range=all").status_code == 200
+        for export_format in ("csv", "xlsx", "json"):
+            exported = owner.get(f"/reports/ai-analysis/exports/{export_format}?range=all")
+            assert exported.status_code == 200
+            assert "attachment" in exported.headers["content-disposition"]
+
+        assert other_user.get(f"/documents/{document_id}/ai-analysis").status_code == 404
+        assert (
+            other_user.patch(
+                f"/ai-analysis/findings/{finding['id']}", json={"status": "resolved"}
+            ).status_code
+            == 404
+        )
+        other_analytics = other_user.get("/analytics/summary?range=all").raise_for_status().json()
+        assert other_analytics["kpis"]["total_documents"] == 0
+        assert other_user.get("/reports/ai-analysis?range=all").status_code == 404
         assert owner.delete(f"/documents/{document_id}").status_code == 204

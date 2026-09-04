@@ -296,6 +296,189 @@ describe("foundation landing page", () => {
   });
 });
 
+describe("Phase 9A commercial workspace", () => {
+  beforeEach(() => {
+    localStorage.setItem("document_analyzer_token", "test-token");
+    URL.createObjectURL = vi.fn(() => "blob:report");
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("renders compact analytics KPIs, currency-safe values, trends and empty-safe charts", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.includes("/analytics/summary"))
+        return Promise.resolve(
+          response({
+            kpis: {
+              total_documents: 3,
+              completed_documents: 2,
+              total_invoices: 2,
+              currency_totals: [
+                { currency: "USD", total: "1250.00", tax: "100.00", average: "625.00" },
+              ],
+              needs_review: 1,
+              ai_findings: 2,
+              unresolved_ai_findings: 2,
+              high_severity_ai_findings: 1,
+              validation_issue_count: 1,
+            },
+            trends: {
+              invoice_spend: [],
+              invoice_count: [{ period: "2026-09-02", count: 2 }],
+              top_vendors: [{ vendor: "Acme Services", currency: "USD", total: "1250.00" }],
+              document_status: { completed: 2 },
+              validation_status: { valid: 1, invalid: 1 },
+              findings_by_severity: { high: 1, medium: 1 },
+              findings_over_time: {},
+            },
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+    await flush();
+    expect(screen.getByText("Analytics overview")).toBeInTheDocument();
+    expect(screen.getAllByText("$1,250.00")).toHaveLength(2);
+    expect(screen.getByText("Acme Services")).toBeInTheDocument();
+    expect(screen.getByLabelText("2026-09-02: 2 invoices")).toBeInTheDocument();
+  });
+
+  it("loads explainable AI findings and supports review lifecycle actions", async () => {
+    const finding = {
+      id: "finding-1",
+      document_id: id,
+      document_filename: "invoice.pdf",
+      invoice_number: "INV-42",
+      vendor_name: "Acme",
+      category: "arithmetic_anomaly",
+      severity: "high",
+      status: "open",
+      title: "Invoice total does not reconcile",
+      explanation: "Invoice total is USD 1,250, but subtotal plus tax equals USD 1,100.",
+      evidence: { subtotal: "1000" },
+      affected_fields: ["subtotal", "tax", "total"],
+      confidence: null,
+      observed_value: "1250.00",
+      expected_value: "1100.00",
+      created_at: timestamp,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.includes("/ai-analysis/findings") && init?.method === "PATCH")
+        return Promise.resolve(response({ ...finding, status: "resolved" }));
+      if (url.includes("/ai-analysis/findings"))
+        return Promise.resolve(
+          response({ items: [finding], total: 1, page: 1, page_size: 50, total_pages: 1 }),
+        );
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "AI Analysis" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Invoice total does not reconcile" }));
+    expect(screen.getByText(/subtotal plus tax equals/i)).toBeInTheDocument();
+    expect(screen.getByText("1250.00")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    await flush();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) =>
+          String(url).endsWith("/ai-analysis/findings/finding-1") && init?.method === "PATCH",
+      ),
+    ).toBe(true);
+  });
+
+  it("generates and exports a selected report", async () => {
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.includes("/reports/financial/exports/csv"))
+        return Promise.resolve(
+          new Response("report", {
+            headers: { "Content-Disposition": "attachment; filename=invoxa-financial.csv" },
+          }),
+        );
+      if (url.includes("/reports/financial"))
+        return Promise.resolve(response({ report_type: "financial", invoice_count: 2 }));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Reports" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate report" }));
+    await flush();
+    expect(screen.getByText(/"invoice_count": 2/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+    await flush();
+    expect(clickSpy).toHaveBeenCalledOnce();
+  });
+
+  it("keeps AI mutation controls hidden for viewers", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response({ ...user, role: "viewer" }));
+      if (url.includes("/ai-analysis/findings"))
+        return Promise.resolve(
+          response({
+            items: [
+              {
+                id: "f",
+                document_id: id,
+                document_filename: "invoice.pdf",
+                invoice_number: null,
+                vendor_name: null,
+                category: "missing_information",
+                severity: "medium",
+                status: "open",
+                title: "Invoice number missing",
+                explanation: "No invoice number was extracted.",
+                evidence: {},
+                affected_fields: ["invoice_number"],
+                confidence: null,
+                observed_value: null,
+                expected_value: "Present value",
+                created_at: timestamp,
+              },
+            ],
+            total: 1,
+            page: 1,
+            page_size: 50,
+            total_pages: 1,
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "AI Analysis" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Invoice number missing" }));
+    expect(screen.queryByRole("button", { name: "Resolve" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Acknowledge" })).not.toBeInTheDocument();
+  });
+});
+
 describe("frontend authentication security", () => {
   afterEach(() => {
     vi.restoreAllMocks();

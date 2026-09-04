@@ -11,6 +11,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from apps.api.app.auth import router as auth_router
 from apps.api.app.documents import router as documents_router
 from apps.api.app.exports import router as exports_router
+from apps.api.app.insights import router as insights_router
 from apps.api.app.logging import configure_logging
 from apps.api.app.settings import settings
 
@@ -37,6 +38,7 @@ app.add_middleware(
 app.include_router(documents_router)
 app.include_router(auth_router)
 app.include_router(exports_router)
+app.include_router(insights_router)
 
 
 @app.middleware("http")
