@@ -17,7 +17,12 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
+      DOCUMENT_QUEUE_NAME: ${DOCUMENT_QUEUE_NAME:-document-processing}
       QUEUE_RECONCILIATION_INTERVAL_SECONDS: ${QUEUE_RECONCILIATION_INTERVAL_SECONDS:-30}
+      STORAGE_PATH: ${STORAGE_PATH:-storage/documents}
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-10485760}
+      TESSERACT_EXECUTABLE: ${TESSERACT_EXECUTABLE:-tesseract}
+      OCR_RENDER_SCALE: ${OCR_RENDER_SCALE:-2.0}
       MAX_PDF_PAGES: ${MAX_PDF_PAGES:-100}
       MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-50000000}
       OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
@@ -28,6 +33,12 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:5173","http://127.0.0.1:5173"]}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-["localhost","127.0.0.1"]}
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-10}
+      LOGIN_RATE_WINDOW_SECONDS: ${LOGIN_RATE_WINDOW_SECONDS:-300}
+      REGISTRATION_RATE_LIMIT: ${REGISTRATION_RATE_LIMIT:-5}
+      REGISTRATION_RATE_WINDOW_SECONDS: ${REGISTRATION_RATE_WINDOW_SECONDS:-3600}
+      UPLOAD_RATE_LIMIT: ${UPLOAD_RATE_LIMIT:-30}
+      UPLOAD_RATE_WINDOW_SECONDS: ${UPLOAD_RATE_WINDOW_SECONDS:-60}
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-20}
       FORGOT_PASSWORD_RATE_LIMIT: ${FORGOT_PASSWORD_RATE_LIMIT:-5}
       FORGOT_PASSWORD_RATE_WINDOW_SECONDS: ${FORGOT_PASSWORD_RATE_WINDOW_SECONDS:-3600}
@@ -45,7 +56,13 @@ services:
       GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
       GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
       GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:8000/auth/google/callback}
+      GOOGLE_OAUTH_TRANSACTION_EXPIRE_SECONDS: ${GOOGLE_OAUTH_TRANSACTION_EXPIRE_SECONDS:-600}
+      GOOGLE_OAUTH_LOGIN_CODE_EXPIRE_SECONDS: ${GOOGLE_OAUTH_LOGIN_CODE_EXPIRE_SECONDS:-60}
+      GOOGLE_OAUTH_RATE_LIMIT: ${GOOGLE_OAUTH_RATE_LIMIT:-20}
+      GOOGLE_OAUTH_RATE_WINDOW_SECONDS: ${GOOGLE_OAUTH_RATE_WINDOW_SECONDS:-300}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully
       postgres:
@@ -75,7 +92,11 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
+      DOCUMENT_QUEUE_NAME: ${DOCUMENT_QUEUE_NAME:-document-processing}
       QUEUE_RECONCILIATION_INTERVAL_SECONDS: ${QUEUE_RECONCILIATION_INTERVAL_SECONDS:-30}
+      STORAGE_PATH: ${STORAGE_PATH:-storage/documents}
+      TESSERACT_EXECUTABLE: ${TESSERACT_EXECUTABLE:-tesseract}
+      OCR_RENDER_SCALE: ${OCR_RENDER_SCALE:-2.0}
       MAX_PDF_PAGES: ${MAX_PDF_PAGES:-100}
       MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-50000000}
       OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
@@ -83,6 +104,8 @@ services:
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully
       postgres:
@@ -102,18 +125,33 @@ services:
     build:
       context: apps/web
       dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
     ports:
-      - "${WEB_PORT:-5173}:5173"
+      - "${WEB_PORT:-5173}:8080"
     depends_on:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/"]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 10s
     restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   postgres:
     image: postgres:16-alpine
@@ -134,6 +172,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:

@@ -14,12 +14,11 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
     "react": "latest",
-    "react-dom": "latest",
-    "vite": "latest"
+    "react-dom": "latest"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "latest",
     "@eslint/js": "latest",
     "@testing-library/jest-dom": "latest",
     "@testing-library/react": "latest",
@@ -32,6 +31,7 @@
     "prettier": "latest",
     "typescript": "latest",
     "typescript-eslint": "latest",
+    "vite": "latest",
     "vitest": "latest"
   }
 }

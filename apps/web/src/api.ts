@@ -1,4 +1,7 @@
-export const API_BASE_URL = "http://localhost:8000";
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(
+  /\/$/,
+  "",
+);
 export const AUTHENTICATION_LOST_EVENT = "document-analyzer:authentication-lost";
 
 export class AuthenticationLostError extends Error {

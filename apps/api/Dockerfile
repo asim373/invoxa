@@ -14,7 +14,7 @@ RUN apt-get update \
 COPY apps ./apps
 
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir ".[dev]" \
+    && pip install --no-cache-dir . \
     && addgroup --system app \
     && adduser --system --ingroup app app \
     && mkdir -p /app/storage/documents /app/storage/password-reset-outbox \

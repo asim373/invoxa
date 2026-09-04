@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.tsbuildinfo
 .pytest_cache/
+.tmp/
 .verification-*/
 .docker-verification-*/
 .ruff_cache/

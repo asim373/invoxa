@@ -79,6 +79,22 @@ def test_production_settings_reject_weak_secret_and_wildcard_hosts() -> None:
         )
 
 
+def test_production_settings_require_https_cors_and_rate_limiting() -> None:
+    common = {
+        "app_environment": "production",
+        "database_url": "postgresql://safe",
+        "auth_secret_key": SecretStr("a-secure-production-secret-that-is-long-enough"),
+        "frontend_base_url": "https://app.example.com",
+        "allowed_hosts": ["api.example.com"],
+        "smtp_host": "smtp.example.com",
+        "smtp_from_address": "no-reply@example.com",
+    }
+    with pytest.raises(ValueError, match="CORS_ORIGINS"):
+        Settings(**common, cors_origins=["http://app.example.com"], rate_limit_enabled=True)
+    with pytest.raises(ValueError, match="RATE_LIMIT_ENABLED"):
+        Settings(**common, cors_origins=["https://app.example.com"], rate_limit_enabled=False)
+
+
 def test_api_responses_include_minimal_security_headers() -> None:
     response = TestClient(app).get("/health")
 
@@ -86,3 +102,11 @@ def test_api_responses_include_minimal_security_headers() -> None:
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_production_api_responses_include_hsts(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "app_environment", "production")
+
+    response = TestClient(app).get("/health")
+
+    assert response.headers["strict-transport-security"] == "max-age=31536000; includeSubDomains"

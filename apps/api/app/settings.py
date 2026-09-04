@@ -71,8 +71,16 @@ class Settings(BaseSettings):
                 raise ValueError("DATABASE_URL must not use development credentials in production.")
             if "*" in self.cors_origins:
                 raise ValueError("Wildcard CORS origins are not allowed in production.")
+            if not self.cors_origins or any(
+                not origin.startswith("https://") for origin in self.cors_origins
+            ):
+                raise ValueError(
+                    "CORS_ORIGINS must contain only explicit HTTPS origins in production."
+                )
             if not self.allowed_hosts or "*" in self.allowed_hosts:
                 raise ValueError("ALLOWED_HOSTS must be explicitly restricted in production.")
+            if not self.rate_limit_enabled:
+                raise ValueError("RATE_LIMIT_ENABLED must remain enabled in production.")
             if not self.frontend_base_url.startswith("https://"):
                 raise ValueError("FRONTEND_BASE_URL must use HTTPS in production.")
             if not self.smtp_host or not self.smtp_from_address:

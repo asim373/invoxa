@@ -21,6 +21,8 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
       - run: ruff check apps/api
+      - run: ruff format --check apps/api
+      - run: pyright
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -33,16 +35,19 @@ jobs:
       - working-directory: apps/web
         run: npm run lint
       - working-directory: apps/web
+        run: npm run format:check
+      - working-directory: apps/web
         run: npm run build
       - working-directory: apps/web
         run: npm audit --omit=dev --audit-level=high
       - run: docker compose config --quiet
-      - run: docker compose build api worker web
+      - run: docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet
+      - run: docker compose build api worker migrate web
       - run: docker compose run --rm worker tesseract --version
       - run: docker compose run --rm worker sh -c "tesseract --list-langs | grep -Fx eng"
       - run: docker compose up -d postgres redis
-      - run: docker compose run --rm api alembic upgrade head
-      - run: docker compose up -d --wait api worker
+      - run: docker compose run --rm migrate
+      - run: docker compose up -d --wait api worker web
       - run: RUN_DOCKER_INTEGRATION=1 pytest apps/api/tests/test_docker_regression.py
       - if: always()
         run: docker compose logs api worker

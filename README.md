@@ -1,115 +1,202 @@
-# Invoxa — Document & Invoice Analyzer
+# Invoxa - Document & Invoice Analyzer
 
-A privacy-first SaaS application for uploading business documents, extracting invoice
-data, reviewing results, and exporting structured records. The stack includes FastAPI,
-React with TypeScript and Vite, PostgreSQL, Redis, and a resilient background worker.
+Invoxa is a production-minded B2B document workflow for uploading invoices, extracting
+structured financial data, reviewing explainable AI Analysis findings, and exporting
+auditable records. It combines a FastAPI modular monolith, a durable Redis-backed worker,
+PostgreSQL, and a responsive React interface without requiring a paid AI or LLM service.
 
-## Current capabilities
+![Invoxa](apps/web/public/invoxa-logo.jpg)
 
-- Account registration, bearer-token authentication, roles, and password recovery
-- Owner-scoped document upload, listing, search, filtering, sorting, and pagination
-- Secure PDF and image validation with configurable size, page, pixel, and OCR limits
-- PDF text extraction plus OCR fallback for scanned PDFs and supported image formats
-- Rule-based invoice fields and line-item extraction with validation information
-- Reliable Redis queue processing, abandoned-job recovery, and queued-job reconciliation
-- Document preview, extracted text, processing states, reprocessing, and deletion
-- Individual and bulk CSV, XLSX, and JSON exports
-- Explainable AI Analysis findings with acknowledgement, resolution, and reopening
-- Ownership-scoped analytics, trends, and financial/AI/processing-quality reports
-- Health/readiness checks, structured logging, security headers, and rate limiting
-- Docker Compose services and automated CI regression checks
+## Capabilities
+
+- Email/password authentication, password recovery, Google OAuth/OIDC, RBAC, and ownership isolation
+- Owner-scoped PDF, JPG, JPEG, and PNG upload, preview, search, filters, sorting, and pagination
+- PDF text extraction and Tesseract OCR fallback with file, page, pixel, size, and timeout limits
+- Invoice fields, line items, extraction provenance, confidence, and deterministic validation
+- Durable Redis processing with in-flight recovery, queue reconciliation, reprocessing, and safe failure states
+- Explainable AI Analysis with arithmetic, duplicate, missing-field, confidence, date, tax, and statistical amount findings
+- Finding acknowledgement, resolution, reopening, evidence, severity, status, and source-document drill-down
+- Server-side KPIs, trends, multi-currency-safe totals, and financial/AI/processing reports
+- CSV, XLSX, and JSON document/report exports with spreadsheet-injection protection
+- Responsive commercial UI, health/readiness checks, structured logs, rate limiting, and Docker deployment assets
+
+## Architecture
+
+```text
+Browser (React/TypeScript)
+        |
+        v
+FastAPI API ------ PostgreSQL
+    |                  |
+    +---- Redis queue -+---- Worker ---- PDF extraction / Tesseract OCR
+                                      |
+                                      +---- validation + AI Analysis
+```
+
+The API is the authentication, authorization, query, analytics, and reporting boundary.
+Uploads are persisted before a queue job is published. The worker recovers abandoned jobs and
+reconciles queued database records. AI Analysis is isolated from the extraction transaction so
+an optional analysis failure does not destroy usable OCR results or leave processing stuck.
+
+See [Architecture](docs/ARCHITECTURE.md), [Deployment](docs/DEPLOYMENT.md), and the
+[User guide](docs/USER_GUIDE.md) for detailed design and workflows.
+
+## Technology stack
+
+| Layer | Technology |
+| --- | --- |
+| Web | React, TypeScript, Vite, NGINX production runtime |
+| API | Python 3.12, FastAPI, Pydantic, SQLAlchemy |
+| Data | PostgreSQL 16, Alembic |
+| Queue | Redis 7, durable list/in-flight workflow |
+| Documents | pypdf, pypdfium2, Pillow, Tesseract OCR |
+| Exports | Python CSV/JSON, openpyxl |
+| Quality | pytest, Vitest, Ruff, Pyright, ESLint, Prettier |
+
+## Repository structure
+
+```text
+apps/api/app/                 API, security, extraction, analysis, reports, and worker code
+apps/api/migrations/          Ordered Alembic migrations
+apps/api/tests/               Unit, security, integration, and regression tests
+apps/web/src/                 React application and frontend tests
+apps/web/public/              Versioned public brand assets
+docs/                         Architecture, deployment, and product documentation
+docker-compose.yml            Local/reference multi-service stack
+docker-compose.production.yml Production hardening override
+```
 
 ## Prerequisites
 
-- Docker Desktop with Compose v2
-- Node.js 20+ and npm 10+ for local frontend tooling
-- Python 3.12+ for local backend tooling (optional when using Docker)
+- Docker Desktop or Docker Engine with Compose v2
+- Node.js 20+ and npm 10+ for local web development
+- Python 3.12+ for local API development
+- Tesseract with English language data when running the worker outside Docker
 
-## Run with Docker
+## Quick start with Docker
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up --build
+docker compose up --build -d
+docker compose ps
 ```
 
-Open `http://localhost:5173` for the frontend, `http://localhost:8000/health` for API health, and `http://localhost:8000/health/ready` for readiness.
+Replace local placeholders in `.env` before starting. Open:
 
-Stop with `Ctrl+C`, or run `docker compose down`.
+- Web: `http://localhost:5173`
+- API health: `http://localhost:8000/health`
+- Dependency readiness: `http://localhost:8000/health/ready`
 
-## Run backend locally
+The one-shot `migrate` service applies Alembic migrations before API/worker startup. Stopping
+with `docker compose down` preserves named volumes; do not add `--volumes` unless deletion is
+explicitly intended.
+
+## Local development
+
+Start dependencies:
+
+```powershell
+docker compose up -d postgres redis
+```
+
+Run API and worker in separate terminals:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
+alembic upgrade head
 uvicorn apps.api.app.main:app --reload --port 8000
 ```
 
-The local backend expects PostgreSQL and Redis from Docker Compose. Start only those services with `docker compose up postgres redis`.
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m apps.api.app.worker
+```
 
-## Run frontend locally
+Run the web app:
 
 ```powershell
 Set-Location apps\web
-npm install
+npm ci
 npm run dev
 ```
 
+## Configuration
+
+Copy `.env.example` to `.env`; `.env` is ignored by Git. Configuration groups include:
+
+- PostgreSQL: `POSTGRES_*`, `DATABASE_URL`
+- Redis/queue: `REDIS_URL`, reconciliation interval
+- Authentication: `AUTH_SECRET_KEY`, token lifetime, rate limits
+- Routing: `VITE_API_BASE_URL`, `FRONTEND_BASE_URL`, `CORS_ORIGINS`, `ALLOWED_HOSTS`
+- Password recovery: SMTP and development-only outbox settings
+- Google Sign-In: OAuth client ID, secret, and exact callback URI
+- OCR safety: page, pixel, upload, and timeout limits
+
+Never commit `.env`, credential JSON, tokens, dumps, uploaded documents, or password-reset outbox
+content. Production values and Google setup are documented in [Deployment](docs/DEPLOYMENT.md).
+
 ## Quality checks
 
-Backend: `python -m ruff check .`, `python -m ruff format --check .`, `python -m pyright`, `python -m pytest`
-
-Frontend: `npm run lint`, `npm run format:check`, `npm run test:run`, `npm run build`
-
-Docker configuration: `docker compose config --quiet`
-
-## Database migrations
-
-The API container applies migrations when it starts. To apply them explicitly:
+From the repository root:
 
 ```powershell
-docker compose run --rm api alembic upgrade head
+python -m pytest
+python -m ruff check apps/api
+python -m ruff format --check apps/api
+python -m pyright
 ```
 
-## AI Analysis and reports
+From `apps/web`:
 
-AI Analysis runs after extraction and validation complete. The document is committed as
-usable first; analysis then runs in a separate transaction so an analysis failure cannot
-erase OCR results or leave processing stuck. Findings are persisted and a stable signature
-makes re-analysis idempotent while preserving review state.
+```powershell
+npm run test:run
+npm run lint
+npm run format:check
+npm run build
+npm audit --omit=dev
+```
 
-The analysis combines existing deterministic financial validation with machine-assisted
-statistical detection. Amount anomalies use the median and median absolute deviation (MAD)
-within the same currency, requiring at least five prior invoices globally or four for the
-same vendor. Small samples produce no statistical anomaly claim. Duplicate analysis uses
-content hashes for exact file duplicates and multiple normalized invoice signals for probable
-duplicates. Missing fields, dates, extraction validation evidence, arithmetic, and tax
-consistency checks always include a human-readable reason; they do not claim fraud or legal
-tax compliance. No paid or external AI service is required, and invoice data is not sent to
-an AI provider.
+Docker verification:
 
-The Analytics view calculates KPIs and trends on the server and keeps currency totals
-separate. Reports provide financial summary, AI Analysis, and processing-quality data with
-CSV, XLSX, and JSON exports. PDF report export is intentionally deferred: the current stack
-has no PDF report renderer, and adding one solely for this phase would add disproportionate
-runtime and maintenance cost compared with the printable UI and spreadsheet exports.
+```powershell
+docker compose config --quiet
+docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet
+$env:RUN_DOCKER_INTEGRATION="1"
+python -m pytest apps/api/tests/test_docker_regression.py
+```
 
-## Production notes
+The Docker regression suite uses disposable application records for PDF/JPG/PNG, rapid uploads,
+AI Analysis, reports, exports, and cross-user denial. It does not reset volumes or the database.
 
-- Replace every development placeholder in `.env` before deployment, especially
-  `AUTH_SECRET_KEY`, database credentials, and allowed origins/hosts.
-- Use durable object/file storage instead of the local volume when deploying more than
-  one API or worker instance.
-- Configure SMTP for password recovery; the local outbox is intended only for development.
-- To enable Google Sign-In, create a Google OAuth 2.0 Web application and configure
-  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and `GOOGLE_OAUTH_REDIRECT_URI`.
-  Register `http://localhost:8000/auth/google/callback` for local development. In production,
-  register the exact HTTPS API callback URL and set `FRONTEND_BASE_URL` to the exact HTTPS web
-  origin. Google Sign-In remains visibly unavailable until both credentials are configured.
-- Terminate TLS at the hosting platform or reverse proxy and keep PostgreSQL and Redis on
-  private networks.
-- Back up both PostgreSQL and document storage, and test restoration regularly.
+## Production
 
-## Environment
+Invoxa expects HTTPS termination at a trusted reverse proxy or hosting platform. PostgreSQL and
+Redis remain private. The production override binds web/API to loopback and removes published
+database/cache ports:
 
-Copy `.env.example` to `.env`. The example contains development-only placeholders and no real secrets.
+```powershell
+docker compose --env-file .env.production `
+  -f docker-compose.yml -f docker-compose.production.yml up -d --build
+```
+
+Production secrets and domain-specific OAuth values are deployment inputs, not repository
+content. A domain, cloud purchase, paid monitoring, or paid AI API is not required to verify the
+codebase.
+
+## Honest scope and limitations
+
+- English Tesseract data is installed; additional OCR languages require image customization.
+- Named-volume storage is single-host; horizontal scaling requires shared object/file storage.
+- Currency totals remain separate; Invoxa does not perform FX conversion.
+- AI Analysis assists review and does not claim fraud detection, legal advice, or tax compliance.
+- PDF reports are deferred; report exports are CSV, XLSX, and JSON.
+- SMTP and production Google credentials are required only for those production integrations.
+- Backups, TLS, monitoring, and infrastructure malware scanning are operator responsibilities.
+
+## Documentation
+
+- [Architecture and engineering decisions](docs/ARCHITECTURE.md)
+- [Production deployment and operations](docs/DEPLOYMENT.md)
+- [Product and user workflows](docs/USER_GUIDE.md)
