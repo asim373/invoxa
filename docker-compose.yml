@@ -42,6 +42,9 @@ services:
       SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
       SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
       PASSWORD_RESET_DEV_OUTBOX_PATH: ${PASSWORD_RESET_DEV_OUTBOX_PATH:-storage/password-reset-outbox}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:8000/auth/google/callback}
     depends_on:
       storage-init:
         condition: service_completed_successfully

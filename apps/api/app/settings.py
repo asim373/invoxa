@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     smtp_starttls: bool = True
     smtp_use_ssl: bool = False
     password_reset_dev_outbox_path: Path = Path("storage/password-reset-outbox")
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: SecretStr | None = None
+    google_oauth_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+    google_oauth_transaction_expire_seconds: int = 600
+    google_oauth_login_code_expire_seconds: int = 60
+    google_oauth_rate_limit: int = 20
+    google_oauth_rate_window_seconds: int = 300
 
     @model_validator(mode="after")
     def reject_insecure_production_defaults(self) -> "Settings":
@@ -70,8 +77,16 @@ class Settings(BaseSettings):
                 raise ValueError("FRONTEND_BASE_URL must use HTTPS in production.")
             if not self.smtp_host or not self.smtp_from_address:
                 raise ValueError("SMTP_HOST and SMTP_FROM_ADDRESS are required in production.")
+            if self.google_oauth_client_id and not self.google_oauth_redirect_uri.startswith(
+                "https://"
+            ):
+                raise ValueError("GOOGLE_OAUTH_REDIRECT_URI must use HTTPS in production.")
         if self.smtp_starttls and self.smtp_use_ssl:
             raise ValueError("SMTP_STARTTLS and SMTP_USE_SSL cannot both be enabled.")
+        if bool(self.google_oauth_client_id) != bool(self.google_oauth_client_secret):
+            raise ValueError(
+                "GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET must be configured together."
+            )
         return self
 
 

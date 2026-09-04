@@ -101,6 +101,11 @@ runtime and maintenance cost compared with the printable UI and spreadsheet expo
 - Use durable object/file storage instead of the local volume when deploying more than
   one API or worker instance.
 - Configure SMTP for password recovery; the local outbox is intended only for development.
+- To enable Google Sign-In, create a Google OAuth 2.0 Web application and configure
+  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and `GOOGLE_OAUTH_REDIRECT_URI`.
+  Register `http://localhost:8000/auth/google/callback` for local development. In production,
+  register the exact HTTPS API callback URL and set `FRONTEND_BASE_URL` to the exact HTTPS web
+  origin. Google Sign-In remains visibly unavailable until both credentials are configured.
 - Terminate TLS at the hosting platform or reverse proxy and keep PostgreSQL and Redis on
   private networks.
 - Back up both PostgreSQL and document storage, and test restoration regularly.

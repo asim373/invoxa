@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App, DOCUMENT_POLL_INTERVAL_MS } from "./main";
@@ -291,8 +291,85 @@ describe("foundation landing page", () => {
     localStorage.clear();
     render(<App />);
     expect(
-      screen.getByRole("heading", { name: /document & invoice analyzer/i }),
+      screen.getByRole("img", { name: /invoxa.*document & invoice analyzer/i }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("commercial authentication interface", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    window.history.replaceState({}, "", "/");
+  });
+
+  it("renders the approved sign-in content and real Google initiation link", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({ enabled: true }));
+    render(<App />);
+    await flush();
+
+    expect(screen.getByRole("heading", { name: "Sign into Invoxa" })).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Upload and process business documents, review extracted information with AI, and export structured invoice data.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Welcome back")).not.toBeInTheDocument();
+    expect(screen.queryByText("Secure document workspace")).not.toBeInTheDocument();
+    expect(screen.queryByText(/don't have an account/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Continue with Google" })).toHaveAttribute(
+      "href",
+      "http://localhost:8000/auth/google/start",
+    );
+  });
+
+  it("switches account mode and exposes an accessible password visibility control", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({ enabled: false }));
+    render(<App />);
+    await flush();
+    const password = screen.getByLabelText("Password");
+    expect(password).toHaveAttribute("type", "password");
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(password).toHaveAttribute("type", "text");
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    expect(screen.getByRole("heading", { name: "Create your Invoxa account" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue with Google" })).not.toBeInTheDocument();
+  });
+
+  it("shows safe Google callback errors without provider details", async () => {
+    window.history.replaceState({}, "", "/?google_error=invalid_state");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({ enabled: true }));
+    render(<App />);
+    await flush();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Google sign-in session expired. Please try again.",
+    );
+    expect(window.location.search).toBe("");
+  });
+
+  it("exchanges a one-time Google callback code through the existing token flow", async () => {
+    const code = "g".repeat(48);
+    window.history.replaceState({}, "", `/?google_code=${code}`);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/google/config")) return Promise.resolve(response({ enabled: true }));
+      if (url.endsWith("/auth/google/exchange")) {
+        return Promise.resolve(response({ access_token: "google-invoxa-token" }));
+      }
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    await flush();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/auth/google/exchange",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ code }) }),
+    );
+    expect(localStorage.getItem("document_analyzer_token")).toBe("google-invoxa-token");
+    expect(window.location.search).toBe("");
   });
 });
 
@@ -501,9 +578,9 @@ describe("frontend authentication security", () => {
     expect(localStorage.getItem("document_analyzer_token")).toBeNull();
     expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
     expect(screen.getByText("Your session expired. Please sign in again.")).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     await new Promise((resolve) => window.setTimeout(resolve, 20));
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("hides mutation controls for a viewer role", async () => {
@@ -533,11 +610,17 @@ describe("password recovery", () => {
   });
 
   it("opens the forgot-password form and shows the generic success response", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      response({
-        detail: "If an account exists for this email, password reset instructions have been sent.",
-      }),
-    );
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/google/config")) {
+        return Promise.resolve(response({ enabled: false }));
+      }
+      return Promise.resolve(
+        response({
+          detail:
+            "If an account exists for this email, password reset instructions have been sent.",
+        }),
+      );
+    });
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Forgot password?" }));
     fireEvent.change(screen.getByLabelText("Email"), { target: { value: "person@example.com" } });
@@ -656,11 +739,14 @@ describe("export and productivity controls", () => {
     fireEvent.change(screen.getByLabelText("Status"), { target: { value: "completed" } });
     fireEvent.change(screen.getByLabelText("File type"), { target: { value: "application/pdf" } });
     fireEvent.change(screen.getByLabelText("Sort"), { target: { value: "filename:asc" } });
-    fireEvent.click(screen.getByRole("button", { name: "Search" }));
-    await flush();
-    const combinedUrl = fetchMock.mock.calls
-      .map(([input]) => String(input))
-      .find((url) => url.includes("search=Acme"));
+    expect(screen.queryByRole("button", { name: "Search" })).not.toBeInTheDocument();
+    const combinedUrl = await waitFor(() => {
+      const url = fetchMock.mock.calls
+        .map(([input]) => String(input))
+        .find((requestUrl) => requestUrl.includes("search=Acme"));
+      expect(url).toBeDefined();
+      return url;
+    });
     expect(combinedUrl).toContain("status=completed");
     expect(combinedUrl).toContain("mime_type=application%2Fpdf");
     expect(combinedUrl).toContain("sort_by=filename");
