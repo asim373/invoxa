@@ -1247,7 +1247,38 @@ input:focus-visible,
   align-items: start;
 }
 .findings-table {
-  min-width: 730px;
+  min-width: 700px;
+  table-layout: fixed;
+}
+.findings-table th:nth-child(1) {
+  width: 78px;
+}
+.findings-table th:nth-child(2) {
+  width: 230px;
+}
+.findings-table th:nth-child(3) {
+  width: 155px;
+}
+.findings-table th:nth-child(4) {
+  width: 78px;
+}
+.findings-table th:nth-child(5) {
+  width: 145px;
+}
+.findings-table th:nth-child(2),
+.findings-table th:nth-child(3),
+.findings-table td:nth-child(2),
+.findings-table td:nth-child(3) {
+  text-align: left;
+}
+.findings-table td:nth-child(3) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.findings-table th:nth-child(5),
+.findings-table td:nth-child(5) {
+  white-space: nowrap;
 }
 .findings-table tr.selected {
   background: #edf2ff;
@@ -1259,7 +1290,8 @@ input:focus-visible,
   text-transform: capitalize;
 }
 .table-link {
-  max-width: 270px;
+  width: 100%;
+  max-width: none;
   padding: 0;
   overflow: hidden;
   border: 0;
@@ -1281,6 +1313,11 @@ input:focus-visible,
   font-size: 11px;
   font-weight: 750;
   text-transform: capitalize;
+  white-space: nowrap;
+}
+.finding-badge {
+  min-width: 54px;
+  justify-content: center;
 }
 .finding-badge.low {
   color: #315d4c;
@@ -1372,6 +1409,142 @@ input:focus-visible,
   overflow-wrap: anywhere;
 }
 
+.structured-report h4 {
+  margin: 0 0 12px;
+  color: #172033;
+  font-size: 16px;
+}
+.report-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 10px;
+}
+.report-metrics > div,
+.report-currency > div,
+.report-breakdown section {
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  background: #f8fafc;
+}
+.report-metrics span,
+.report-currency span {
+  display: block;
+  color: #657086;
+  font-size: 11px;
+}
+.report-currency b {
+  color: #172033;
+  font-weight: 700;
+}
+.report-metrics strong {
+  display: block;
+  margin-top: 5px;
+  color: #172033;
+  font-size: 20px;
+}
+.report-currency {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.report-currency strong {
+  display: block;
+  margin-bottom: 6px;
+}
+.report-breakdown {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.report-breakdown h5 {
+  margin: 0 0 7px;
+  font-size: 12px;
+}
+.report-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid #e2e8f0;
+  color: #657086;
+  font-size: 12px;
+}
+.report-row:last-child {
+  border-bottom: 0;
+}
+.report-row strong {
+  color: #172033;
+}
+.raw-report {
+  margin-top: 10px;
+}
+.raw-report summary {
+  width: max-content;
+  color: #2859ce;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.raw-report pre {
+  margin-top: 10px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(10 32 64 / 48%);
+}
+.confirmation-modal {
+  width: min(420px, 100%);
+  padding: 20px;
+  border: 1px solid #dfe4ee;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 18px 50px rgb(15 23 42 / 22%);
+}
+.confirmation-modal h2 {
+  margin: 0;
+  color: #172033;
+  font-size: 18px;
+}
+.confirmation-modal p {
+  margin: 10px 0 0;
+  color: #657086;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.confirmation-modal .modal-filename {
+  overflow: hidden;
+  color: #33415c;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+.modal-actions .danger-button {
+  padding: 9px 13px;
+  border: 1px solid #dc2626;
+  border-radius: 8px;
+  background: #dc2626;
+  color: #ffffff;
+  font-weight: 750;
+}
+.modal-actions .danger-button:hover {
+  background: #b91c1c;
+}
+
 @media (max-width: 980px) {
   .insight-kpis {
     grid-template-columns: repeat(3, 1fr);
@@ -1388,6 +1561,9 @@ input:focus-visible,
 }
 
 @media (max-width: 680px) {
+  .report-metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
   .phase-heading {
     align-items: stretch;
     flex-direction: column;

@@ -151,6 +151,137 @@ function formatMoney(value: string | null, currency: string | null) {
   return amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function metricLabel(value: string) {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function ReportPreview({
+  report,
+  reportType,
+}: {
+  report: Record<string, unknown>;
+  reportType: ReportType;
+}) {
+  const summary = asRecord(report.summary);
+  const currencyTotals = Array.isArray(summary.currency_totals) ? summary.currency_totals : [];
+  const title =
+    reportType === "financial"
+      ? "Financial Summary Report"
+      : reportType === "ai-analysis"
+        ? "AI Analysis Report"
+        : "Processing Quality Report";
+  const headlineMetrics = [
+    ["Total documents", summary.total_documents],
+    ["Completed", summary.completed_documents],
+    ["Needs review", summary.needs_review],
+    ["AI findings", summary.ai_findings],
+  ] as const;
+  const detailSource: Array<[string, unknown]> =
+    reportType === "ai-analysis"
+      ? [
+          ["Findings by severity", report.findings_by_severity],
+          ["Review status", report.review_status],
+        ]
+      : reportType === "processing-quality"
+        ? [
+            ["Processing status", report.document_status],
+            ["Validation status", report.validation_status],
+          ]
+        : [["Top vendors", report.top_vendors]];
+
+  return (
+    <div className="structured-report">
+      <h4>{title}</h4>
+      <div className="report-metrics" aria-label="Report summary">
+        {headlineMetrics.map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>{typeof value === "number" || typeof value === "string" ? value : "—"}</strong>
+          </div>
+        ))}
+      </div>
+      {currencyTotals.length > 0 && (
+        <div className="report-currency" aria-label="Financial summary">
+          {currencyTotals.map((item, index) => {
+            const currency = asRecord(item);
+            const code = typeof currency.currency === "string" ? currency.currency : null;
+            return (
+              <div key={`${code ?? "currency"}-${index}`}>
+                <strong>{code ?? "Currency"}</strong>
+                <span>
+                  Total{" "}
+                  <b>
+                    {formatMoney(typeof currency.total === "string" ? currency.total : null, code)}
+                  </b>
+                </span>
+                <span>
+                  Tax{" "}
+                  <b>{formatMoney(typeof currency.tax === "string" ? currency.tax : null, code)}</b>
+                </span>
+                <span>
+                  Average{" "}
+                  <b>
+                    {formatMoney(
+                      typeof currency.average === "string" ? currency.average : null,
+                      code,
+                    )}
+                  </b>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <div className="report-breakdown">
+        {detailSource.map(([heading, value]) => {
+          const rows: Array<[string, string]> = Array.isArray(value)
+            ? value.slice(0, 4).map((item) => {
+                const row = asRecord(item);
+                return [
+                  String(row.vendor ?? row.period ?? row.filename ?? "Item"),
+                  typeof row.total === "string"
+                    ? formatMoney(row.total, typeof row.currency === "string" ? row.currency : null)
+                    : String(row.count ?? row.findings ?? "—"),
+                ];
+              })
+            : Object.entries(asRecord(value)).map(([label, item]) => [label, String(item)]);
+          if (rows.length === 0) return null;
+          return (
+            <section key={heading}>
+              <h5>{heading}</h5>
+              {rows.map(([label, value]) => (
+                <div className="report-row" key={label}>
+                  <span>{metricLabel(label)}</span>
+                  <strong>{value}</strong>
+                </div>
+              ))}
+            </section>
+          );
+        })}
+        {reportType === "processing-quality" && report.low_confidence_documents !== undefined && (
+          <section>
+            <h5>Extraction review</h5>
+            <div className="report-row">
+              <span>Low Confidence Documents</span>
+              <strong>{String(report.low_confidence_documents)}</strong>
+            </div>
+          </section>
+        )}
+      </div>
+      <details className="raw-report">
+        <summary>View raw JSON</summary>
+        <pre>{JSON.stringify(report, null, 2)}</pre>
+      </details>
+    </div>
+  );
+}
+
 const workspaceLabels: Record<WorkspaceView, { title: string; description: string }> = {
   overview: {
     title: "Overview",
@@ -288,12 +419,24 @@ export function App() {
   const [reportType, setReportType] = useState<ReportType>("financial");
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<DocumentItem | null>(null);
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement | null>(null);
   const requestedDocumentId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+    deleteCancelRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setDeleteTarget(null);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [deleteTarget]);
 
   useEffect(() => {
     if (token || resetToken) return;
@@ -635,10 +778,6 @@ export function App() {
   }
 
   async function deleteDocument(documentId: string) {
-    const confirmed = window.confirm("Delete this document permanently?");
-
-    if (!confirmed) return;
-
     setError("");
     setSuccess("");
 
@@ -661,6 +800,23 @@ export function App() {
     } catch (requestError) {
       if (requestError instanceof AuthenticationLostError) return;
       setError(requestError instanceof Error ? requestError.message : "Unable to delete document.");
+    }
+  }
+
+  function containDeleteDialogFocus(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Tab") return;
+    const controls = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+    );
+    if (controls.length === 0) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -1108,9 +1264,7 @@ export function App() {
             </form>
           )}
 
-          <p className="security-note">
-            <span aria-hidden="true">◇</span> Secure. Private. Built for your business.
-          </p>
+          <p className="security-note">Secure. Private. Built for your business.</p>
         </section>
       </main>
     );
@@ -1381,7 +1535,7 @@ export function App() {
               <div className="phase-heading">
                 <div>
                   <p className="eyebrow">Review attention</p>
-                  <h2 id="ai-heading">AI Analysis</h2>
+                  <h2 id="ai-heading">Review findings</h2>
                   <p>Statistical and machine-assisted checks with transparent evidence.</p>
                 </div>
                 <div className="compact-filters">
@@ -1657,7 +1811,7 @@ export function App() {
                       ))}
                     </div>
                   </div>
-                  <pre>{JSON.stringify(report, null, 2)}</pre>
+                  <ReportPreview report={report} reportType={reportType} />
                 </div>
               ) : (
                 !reportLoading && (
@@ -1927,7 +2081,7 @@ export function App() {
                                   </button>
                                   <button
                                     className="danger-button"
-                                    onClick={() => void deleteDocument(document.id)}
+                                    onClick={() => setDeleteTarget(document)}
                                   >
                                     Delete
                                   </button>
@@ -2226,6 +2380,46 @@ export function App() {
           </div>
         </section>
       </div>
+      {deleteTarget && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="confirmation-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-dialog-title"
+            aria-describedby="delete-dialog-description"
+            onKeyDown={containDeleteDialogFocus}
+          >
+            <h2 id="delete-dialog-title">Delete document?</h2>
+            <p className="modal-filename">{deleteTarget.original_filename}</p>
+            <p id="delete-dialog-description">
+              This action permanently deletes this document and its associated analysis. This action
+              cannot be undone.
+            </p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                ref={deleteCancelRef}
+                onClick={() => setDeleteTarget(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="danger-button"
+                onClick={() => {
+                  const documentId = deleteTarget.id;
+                  setDeleteTarget(null);
+                  void deleteDocument(documentId);
+                }}
+                type="button"
+              >
+                Delete document
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

@@ -317,6 +317,8 @@ describe("commercial authentication interface", () => {
     expect(screen.queryByText("Welcome back")).not.toBeInTheDocument();
     expect(screen.queryByText("Secure document workspace")).not.toBeInTheDocument();
     expect(screen.queryByText(/don't have an account/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Secure. Private. Built for your business.")).toBeInTheDocument();
+    expect(screen.queryByText(/◇/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Continue with Google" })).toHaveAttribute(
       "href",
       "http://localhost:8000/auth/google/start",
@@ -466,6 +468,9 @@ describe("Phase 9A commercial workspace", () => {
     await flush();
     fireEvent.click(screen.getByRole("button", { name: "AI Analysis" }));
     await flush();
+    expect(screen.getByRole("heading", { level: 1, name: "AI Analysis" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Review findings" })).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { name: "AI Analysis" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Invoice total does not reconcile" }));
     expect(screen.getByText(/subtotal plus tax equals/i)).toBeInTheDocument();
     expect(screen.getByText("1250.00")).toBeInTheDocument();
@@ -479,7 +484,7 @@ describe("Phase 9A commercial workspace", () => {
     ).toBe(true);
   });
 
-  it("generates and exports a selected report", async () => {
+  it("renders structured reports, keeps raw JSON collapsed, switches type and exports", async () => {
     const clickSpy = vi
       .spyOn(HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => undefined);
@@ -492,8 +497,41 @@ describe("Phase 9A commercial workspace", () => {
             headers: { "Content-Disposition": "attachment; filename=invoxa-financial.csv" },
           }),
         );
+      if (url.includes("/reports/processing-quality"))
+        return Promise.resolve(
+          response({
+            report_type: "processing-quality",
+            summary: {
+              total_documents: 8,
+              completed_documents: 8,
+              needs_review: 8,
+              ai_findings: 14,
+              currency_totals: [
+                { currency: "USD", total: "20943.80", tax: "1550.80", average: "2617.975" },
+              ],
+            },
+            document_status: { completed: 8 },
+            validation_status: { valid: 6, needs_review: 2 },
+            low_confidence_documents: 2,
+          }),
+        );
+      if (url.includes("/reports/ai-analysis"))
+        return Promise.resolve(
+          response({
+            report_type: "ai-analysis",
+            summary: {},
+            findings_by_severity: { high: 2 },
+            review_status: { open: 14 },
+          }),
+        );
       if (url.includes("/reports/financial"))
-        return Promise.resolve(response({ report_type: "financial", invoice_count: 2 }));
+        return Promise.resolve(
+          response({
+            report_type: "financial",
+            summary: {},
+            top_vendors: [{ vendor: "Acme Services", currency: "USD", total: "1250.00" }],
+          }),
+        );
       return Promise.resolve(
         response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
       );
@@ -501,12 +539,82 @@ describe("Phase 9A commercial workspace", () => {
     render(<App />);
     await flush();
     fireEvent.click(screen.getByRole("button", { name: "Reports" }));
+    fireEvent.change(screen.getByLabelText("Report type"), {
+      target: { value: "processing-quality" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Generate report" }));
     await flush();
-    expect(screen.getByText(/"invoice_count": 2/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Processing Quality Report" })).toBeInTheDocument();
+    expect(screen.getByText("$20,943.80")).toBeInTheDocument();
+    expect(screen.getByText("$1,550.80")).toBeInTheDocument();
+    expect(screen.getByText("$2,617.98")).toBeInTheDocument();
+    const rawJson = screen.getByText("View raw JSON").closest("details");
+    expect(rawJson).not.toHaveAttribute("open");
+    expect(screen.getByRole("button", { name: "Export CSV" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export XLSX" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export JSON" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Report type"), {
+      target: { value: "ai-analysis" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate report" }));
+    await flush();
+    expect(screen.getByRole("heading", { name: "AI Analysis Report" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Report type"), { target: { value: "financial" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate report" }));
+    await flush();
+    expect(screen.getByRole("heading", { name: "Financial Summary Report" })).toBeInTheDocument();
+    expect(screen.getByText("$1,250.00")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     await flush();
     expect(clickSpy).toHaveBeenCalledOnce();
+  });
+
+  it("uses an accessible custom delete dialog with cancel and Escape without deleting", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/me")) return Promise.resolve(response(user));
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+    render(<App />);
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByRole("dialog", { name: "Delete document?" })).toHaveTextContent(
+      "invoice.pdf",
+    );
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("calls the existing document delete endpoint only after modal confirmation", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith(`/documents/${id}`) && init?.method === "DELETE")
+        return Promise.resolve(new Response(null, { status: 204 }));
+      return Promise.resolve(
+        response({ items: [item("completed")], total: 1, page: 1, page_size: 100, total_pages: 1 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete document" }));
+    await flush();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url, init]) => String(url).endsWith(`/documents/${id}`) && init?.method === "DELETE",
+      ),
+    ).toBe(true);
   });
 
   it("keeps AI mutation controls hidden for viewers", async () => {

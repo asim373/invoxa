@@ -1,11 +1,19 @@
-# Invoxa - Document & Invoice Analyzer
+# Invoxa — Document & Invoice Analyzer
 
 Invoxa is a production-minded B2B document workflow for uploading invoices, extracting
 structured financial data, reviewing explainable AI Analysis findings, and exporting
 auditable records. It combines a FastAPI modular monolith, a durable Redis-backed worker,
 PostgreSQL, and a responsive React interface without requiring a paid AI or LLM service.
 
-![Invoxa](apps/web/public/invoxa-logo.jpg)
+<p align="center">
+  <img src="apps/web/public/invoxa-logo.jpg" alt="Invoxa logo" width="180">
+</p>
+
+![Invoxa analytics overview](docs/screenshots/02-overview.png)
+
+## Product demo
+
+[Watch the 47-second Invoxa product demo](docs/demo/invoxa-product-demo.webm)
 
 ## Capabilities
 
@@ -19,6 +27,48 @@ PostgreSQL, and a responsive React interface without requiring a paid AI or LLM 
 - Server-side KPIs, trends, multi-currency-safe totals, and financial/AI/processing reports
 - CSV, XLSX, and JSON document/report exports with spreadsheet-injection protection
 - Responsive commercial UI, health/readiness checks, structured logs, rate limiting, and Docker deployment assets
+
+## Engineering highlights
+
+- Durable upload-to-worker handoff, in-flight recovery, and queue reconciliation prevent silent
+  job loss while preserving terminal document states.
+- Owner-scoped queries and exports combine with role-aware mutations so authorization is enforced
+  at the API boundary rather than delegated to the browser.
+- OAuth 2.0/OpenID Connect uses state, nonce, PKCE, verified provider identity, and a single-use
+  exchange code while reusing Invoxa's existing JWT, RBAC, and `auth_version` controls.
+- AI Analysis separates deterministic financial consistency checks from MAD-based statistical
+  amount detection, and persists explainable evidence without presenting a fraud probability.
+- OCR/extraction failures and optional analysis failures are isolated so previously extracted
+  documents remain usable and recoverable.
+
+## Product tour
+
+**Sign in** — email/password and Google Sign-In within the same authentication boundary.
+
+![Invoxa sign-in](docs/screenshots/01-sign-in.png)
+
+**Overview** — invoice KPIs, review workload, spend trends, top vendors, and finding severity.
+
+![Invoxa overview](docs/screenshots/02-overview.png)
+
+**Documents** — processing KPIs, filters, exports, and owner-scoped document records.
+
+![Invoxa documents](docs/screenshots/03-documents.png)
+
+**Document review** — structured extraction, validation state, and source OCR text.
+
+![Invoxa document analysis](docs/screenshots/04-document-analysis.png)
+
+**AI Analysis** — explainable severity, evidence, and human review actions.
+
+![Invoxa AI Analysis](docs/screenshots/05-ai-analysis.png)
+
+**Reports** — server-generated financial, AI Analysis, and processing-quality reports with CSV, XLSX, and JSON exports.
+
+![Invoxa reports](docs/screenshots/06-reports.png)
+
+The captures use a dedicated fictional `.example` portfolio account and documents labelled as
+fictional demonstration data; they do not represent customers or production usage.
 
 ## Architecture
 
