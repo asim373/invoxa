@@ -1073,34 +1073,6 @@ export function App() {
             </div>
           )}
 
-          {authMode === "login" || authMode === "register" ? (
-            <div className="auth-tabs">
-              <button
-                className={authMode === "login" ? "active" : ""}
-                onClick={() => {
-                  setAuthMode("login");
-                  setError("");
-                  setSuccess("");
-                }}
-                type="button"
-              >
-                Sign in
-              </button>
-
-              <button
-                className={authMode === "register" ? "active" : ""}
-                onClick={() => {
-                  setAuthMode("register");
-                  setError("");
-                  setSuccess("");
-                }}
-                type="button"
-              >
-                Create account
-              </button>
-            </div>
-          ) : null}
-
           {authMode === "forgot" ? (
             <form onSubmit={handleForgotPassword} className="auth-form">
               <label>
@@ -1261,6 +1233,21 @@ export function App() {
                   )}
                 </>
               )}
+              <p className="auth-switch">
+                {authMode === "login" ? "Don't have an account?" : "Already have an account?"}{" "}
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => {
+                    setAuthMode(authMode === "login" ? "register" : "login");
+                    setError("");
+                    setSuccess("");
+                    setPassword("");
+                  }}
+                >
+                  {authMode === "login" ? "Create now" : "Sign in"}
+                </button>
+              </p>
             </form>
           )}
 

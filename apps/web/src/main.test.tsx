@@ -316,7 +316,9 @@ describe("commercial authentication interface", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Welcome back")).not.toBeInTheDocument();
     expect(screen.queryByText("Secure document workspace")).not.toBeInTheDocument();
-    expect(screen.queryByText(/don't have an account/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Don't have an account?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create now" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create account" })).not.toBeInTheDocument();
     expect(screen.getByText("Secure. Private. Built for your business.")).toBeInTheDocument();
     expect(screen.queryByText(/◇/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Continue with Google" })).toHaveAttribute(
@@ -333,9 +335,12 @@ describe("commercial authentication interface", () => {
     expect(password).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByRole("button", { name: "Show password" }));
     expect(password).toHaveAttribute("type", "text");
-    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create now" }));
     expect(screen.getByRole("heading", { name: "Create your Invoxa account" })).toBeInTheDocument();
+    expect(screen.getByText("Already have an account?")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Continue with Google" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(screen.getByRole("heading", { name: "Sign into Invoxa" })).toBeInTheDocument();
   });
 
   it("shows safe Google callback errors without provider details", async () => {
@@ -684,7 +689,7 @@ describe("frontend authentication security", () => {
     await flush();
 
     expect(localStorage.getItem("document_analyzer_token")).toBeNull();
-    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
     expect(screen.getByText("Your session expired. Please sign in again.")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(3);
     await new Promise((resolve) => window.setTimeout(resolve, 20));
@@ -741,7 +746,7 @@ describe("password recovery", () => {
       expect.objectContaining({ method: "POST" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Back to sign in" }));
-    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
   });
 
   it("validates matching reset passwords without sending the token", async () => {
@@ -818,7 +823,7 @@ describe("password recovery", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Your password has been reset");
     expect(window.location.search).toBe("");
     fireEvent.click(screen.getByRole("button", { name: "Back to sign in" }));
-    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
   });
 });
 

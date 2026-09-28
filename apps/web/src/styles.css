@@ -2207,6 +2207,18 @@ input:focus-visible,
   content: "";
   background: #dce5f1;
 }
+.auth-switch {
+  margin: 1px 0 0;
+  color: #71809a;
+  font-size: 12px;
+  text-align: center;
+}
+.auth-switch .text-button {
+  padding: 0;
+  color: var(--invoxa-blue);
+  font-size: inherit;
+  font-weight: 750;
+}
 .google-button {
   display: flex;
   min-height: 44px;
