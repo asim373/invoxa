@@ -4,13 +4,33 @@ from datetime import UTC, datetime
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 from apps.api.app.auth import create_access_token, verify_password
 from apps.api.app.database import get_db
 from apps.api.app.main import app
-from apps.api.app.models import Document, DocumentStatus, User, UserRole
+from apps.api.app.models import (
+    Document,
+    DocumentStatus,
+    Organization,
+    OrganizationMember,
+    ProcessingOperation,
+    User,
+    UserRole,
+    UserSession,
+)
 from apps.api.app.queue import get_document_processing_queue
 from apps.api.app.settings import settings
+
+
+def valid_pdf() -> bytes:
+    import io
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 class FakeScalarResult:
@@ -25,14 +45,38 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.users: list[User] = []
         self.documents: list[Document] = []
+        self.organizations: list[Organization] = []
+        self.memberships: list[OrganizationMember] = []
+        self.processing_operations: list[ProcessingOperation] = []
+        self.user_sessions: list[UserSession] = []
 
     def add(self, value) -> None:
         if isinstance(value, User):
             value.id = value.id or uuid.uuid4()
             value.is_active = True if value.is_active is None else value.is_active
             self.users.append(value)
+        elif isinstance(value, Organization):
+            value.id = value.id or uuid.uuid4()
+            self.organizations.append(value)
+        elif isinstance(value, OrganizationMember):
+            value.id = value.id or uuid.uuid4()
+            self.memberships.append(value)
+        elif isinstance(value, ProcessingOperation):
+            value.id = value.id or uuid.uuid4()
+            self.processing_operations.append(value)
+        elif isinstance(value, UserSession):
+            self.user_sessions.append(value)
         else:
             self.documents.append(value)
+
+    def flush(self) -> None:
+        for value in [
+            *self.users,
+            *self.organizations,
+            *self.memberships,
+            *self.processing_operations,
+        ]:
+            value.id = value.id or uuid.uuid4()
 
     def delete(self, value) -> None:
         self.documents.remove(value)
@@ -49,7 +93,13 @@ class FakeDatabase:
         user.updated_at = now
 
     def get(self, model, identifier):
-        values = self.users if model is User else self.documents
+        values = (
+            self.users
+            if model is User
+            else self.user_sessions
+            if model is UserSession
+            else self.documents
+        )
         return next((value for value in values if value.id == identifier), None)
 
     def scalar(self, statement):
@@ -57,6 +107,15 @@ class FakeDatabase:
         parameters = statement.compile().params
         if entity is User:
             return next((user for user in self.users if user.email in parameters.values()), None)
+        if entity is Organization:
+            return next(
+                (
+                    organization.id
+                    for organization in self.organizations
+                    if organization.slug in parameters.values()
+                ),
+                None,
+            )
         for document in self.documents:
             if document.id in parameters.values() and document.owner_id in parameters.values():
                 return document
@@ -76,7 +135,12 @@ class FakeDatabase:
 
 
 class FakeQueue:
-    def enqueue(self, document_id: uuid.UUID) -> None:
+    def enqueue(
+        self,
+        document_id: uuid.UUID,
+        organization_id: uuid.UUID | None = None,
+        operation_id: uuid.UUID | None = None,
+    ) -> None:
         pass
 
 
@@ -93,7 +157,10 @@ def register(
     email: str = "User@Example.COM",
     password: str = "secure-password-123",
 ):
-    return client.post("/auth/register", json={"email": email, "password": password})
+    return client.post(
+        "/auth/register",
+        json={"email": email, "password": password, "company_name": "Acme Logistics"},
+    )
 
 
 def test_registration_hashes_password_and_returns_public_user(
@@ -105,6 +172,8 @@ def test_registration_hashes_password_and_returns_public_user(
     assert response.json()["email"] == "user@example.com"
     assert "password_hash" not in response.json()
     assert len(database.users) == 1
+    assert len(database.organizations) == 1
+    assert len(database.memberships) == 1
     assert database.users[0].password_hash != "secure-password-123"
     assert verify_password("secure-password-123", database.users[0].password_hash)
 
@@ -262,7 +331,7 @@ def test_document_listing_and_upload_are_owner_scoped(database: FakeDatabase, tm
         uploaded = client.post(
             "/documents",
             headers=headers,
-            files={"file": ("new.pdf", b"%PDF-1.4 invoice", "application/pdf")},
+            files={"file": ("new.pdf", valid_pdf(), "application/pdf")},
         )
     finally:
         settings.storage_path = previous_path
@@ -406,7 +475,7 @@ def test_viewer_can_read_but_cannot_mutate_owned_document(database: FakeDatabase
         upload = client.post(
             "/documents",
             headers=headers,
-            files={"file": ("new.pdf", b"%PDF-1.4", "application/pdf")},
+            files={"file": ("new.pdf", valid_pdf(), "application/pdf")},
         )
     finally:
         settings.storage_path = previous_path

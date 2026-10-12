@@ -4,9 +4,13 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY --chown=node:node . .
-ARG VITE_API_BASE_URL=http://localhost:8000
+ARG VITE_API_BASE_URL
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
-RUN npm run build
+ARG VITE_PUBLIC_APP_URL
+ENV VITE_PUBLIC_APP_URL=$VITE_PUBLIC_APP_URL
+ARG VITE_BUILD_MODE=production
+ENV VITE_BUILD_MODE=$VITE_BUILD_MODE
+RUN npm run build -- --mode $VITE_BUILD_MODE
 
 FROM nginxinc/nginx-unprivileged:1.27-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf

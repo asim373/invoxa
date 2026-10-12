@@ -11,7 +11,7 @@ from typing import Any, BinaryIO, cast
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from apps.api.app.models import Document, InvoiceExtraction, InvoiceLineItem
@@ -46,6 +46,12 @@ SPOOL_MEMORY_LIMIT = 8 * 1024 * 1024
 
 class ExportDocumentsNotFoundError(ValueError):
     pass
+
+
+def _document_scope(owner_id: uuid.UUID, organization_id: uuid.UUID | None):
+    if organization_id is not None:
+        return Document.organization_id == organization_id
+    return and_(Document.owner_id == owner_id, Document.organization_id.is_(None))
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +94,21 @@ def serialize_date(value: date | None) -> str:
 
 
 def create_csv_export(
-    database: Session, owner_id: uuid.UUID, requested_document_ids: Iterable[uuid.UUID]
+    database: Session,
+    owner_id: uuid.UUID,
+    requested_document_ids: Iterable[uuid.UUID],
+    organization_id: uuid.UUID | None = None,
 ) -> BinaryIO:
     document_ids = tuple(dict.fromkeys(requested_document_ids))
     if not document_ids:
         raise ValueError("At least one document ID is required.")
 
-    _verify_owned_documents(database, owner_id, document_ids)
+    _verify_owned_documents(database, owner_id, document_ids, organization_id)
     export_file = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY_LIMIT, mode="w+b")
     try:
         with zipfile.ZipFile(export_file, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            _write_invoices_csv(archive, database, owner_id, document_ids)
-            _write_line_items_csv(archive, database, owner_id, document_ids)
+            _write_invoices_csv(archive, database, owner_id, document_ids, organization_id)
+            _write_line_items_csv(archive, database, owner_id, document_ids, organization_id)
         export_file.seek(0)
         return cast(BinaryIO, export_file)
     except Exception:
@@ -108,12 +117,14 @@ def create_csv_export(
 
 
 def _verify_owned_documents(
-    database: Session, owner_id: uuid.UUID, document_ids: tuple[uuid.UUID, ...]
+    database: Session,
+    owner_id: uuid.UUID,
+    document_ids: tuple[uuid.UUID, ...],
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     statement = select(Document.id).where(
         Document.id.in_(document_ids),
-        Document.owner_id == owner_id,
-        Document.owner_id.is_not(None),
+        _document_scope(owner_id, organization_id),
     )
     found_ids = set(database.scalars(statement).yield_per(QUERY_BATCH_SIZE))
     if found_ids != set(document_ids):
@@ -125,14 +136,14 @@ def _write_invoices_csv(
     database: Session,
     owner_id: uuid.UUID,
     document_ids: tuple[uuid.UUID, ...],
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     statement = (
         select(Document, InvoiceExtraction)
         .outerjoin(InvoiceExtraction, InvoiceExtraction.document_id == Document.id)
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc())
     )
@@ -153,6 +164,7 @@ def _write_line_items_csv(
     database: Session,
     owner_id: uuid.UUID,
     document_ids: tuple[uuid.UUID, ...],
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     statement = (
         select(
@@ -172,8 +184,7 @@ def _write_line_items_csv(
         )
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc(), InvoiceLineItem.position.asc())
     )
@@ -254,13 +265,16 @@ _DATE_COL_INDEX = 5  # 1-based column index for invoice_date
 
 
 def create_xlsx_export(
-    database: Session, owner_id: uuid.UUID, requested_document_ids: Iterable[uuid.UUID]
+    database: Session,
+    owner_id: uuid.UUID,
+    requested_document_ids: Iterable[uuid.UUID],
+    organization_id: uuid.UUID | None = None,
 ) -> BinaryIO:
     document_ids = tuple(dict.fromkeys(requested_document_ids))
     if not document_ids:
         raise ValueError("At least one document ID is required.")
 
-    _verify_owned_documents(database, owner_id, document_ids)
+    _verify_owned_documents(database, owner_id, document_ids, organization_id)
     export_file = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEMORY_LIMIT, mode="w+b")
     try:
         workbook = Workbook()
@@ -269,8 +283,8 @@ def create_xlsx_export(
         invoices_sheet.title = "Invoices"
         line_items_sheet = workbook.create_sheet(title="Line Items")
 
-        _write_invoices_sheet(invoices_sheet, database, owner_id, document_ids)
-        _write_line_items_sheet(line_items_sheet, database, owner_id, document_ids)
+        _write_invoices_sheet(invoices_sheet, database, owner_id, document_ids, organization_id)
+        _write_line_items_sheet(line_items_sheet, database, owner_id, document_ids, organization_id)
 
         workbook.save(export_file)
         export_file.seek(0)
@@ -294,6 +308,7 @@ def _write_invoices_sheet(
     database: Session,
     owner_id: uuid.UUID,
     document_ids: tuple[uuid.UUID, ...],
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     sheet.append(list(INVOICE_HEADERS))
     _apply_sheet_formatting(sheet, INVOICE_HEADERS, _INVOICE_COL_WIDTHS)
@@ -303,8 +318,7 @@ def _write_invoices_sheet(
         .outerjoin(InvoiceExtraction, InvoiceExtraction.document_id == Document.id)
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc())
     )
@@ -320,6 +334,7 @@ def _write_line_items_sheet(
     database: Session,
     owner_id: uuid.UUID,
     document_ids: tuple[uuid.UUID, ...],
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     sheet.append(list(LINE_ITEM_HEADERS))
     _apply_sheet_formatting(sheet, LINE_ITEM_HEADERS, _LINE_ITEM_COL_WIDTHS)
@@ -342,8 +357,7 @@ def _write_line_items_sheet(
         )
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc(), InvoiceLineItem.position.asc())
     )
@@ -419,13 +433,16 @@ def _quantity_string(value: Decimal | None) -> str | None:
 
 
 def create_json_export(
-    database: Session, owner_id: uuid.UUID, requested_document_ids: Iterable[uuid.UUID]
+    database: Session,
+    owner_id: uuid.UUID,
+    requested_document_ids: Iterable[uuid.UUID],
+    organization_id: uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     document_ids = tuple(dict.fromkeys(requested_document_ids))
     if not document_ids:
         raise ValueError("At least one document ID is required.")
 
-    _verify_owned_documents(database, owner_id, document_ids)
+    _verify_owned_documents(database, owner_id, document_ids, organization_id)
 
     line_items_statement = (
         select(
@@ -445,8 +462,7 @@ def create_json_export(
         )
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc(), InvoiceLineItem.position.asc())
     )
@@ -477,8 +493,7 @@ def create_json_export(
         .outerjoin(InvoiceExtraction, InvoiceExtraction.document_id == Document.id)
         .where(
             Document.id.in_(document_ids),
-            Document.owner_id == owner_id,
-            Document.owner_id.is_not(None),
+            _document_scope(owner_id, organization_id),
         )
         .order_by(Document.created_at.asc(), Document.id.asc())
     )

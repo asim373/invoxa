@@ -9,7 +9,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from apps.api.app.ai_analysis import analyze_document, generate_finding_specs
+from apps.api.app.ai_analysis import (
+    analyze_document,
+    financial_validation_summary,
+    generate_finding_specs,
+)
 from apps.api.app.auth import get_current_user
 from apps.api.app.database import Base, get_db
 from apps.api.app.main import app
@@ -22,6 +26,7 @@ from apps.api.app.models import (
     DocumentStatus,
     InvoiceExtraction,
     InvoiceLineItem,
+    Organization,
     User,
     UserRole,
 )
@@ -62,10 +67,12 @@ def add_invoice(
     checksum: str | None = None,
     created_at: datetime | None = None,
     valid: bool = True,
+    organization: Organization | None = None,
 ) -> Document:
     created = created_at or datetime.now(UTC)
     document = Document(
         owner_id=owner.id,
+        organization_id=organization.id if organization is not None else None,
         original_filename=f"{uuid.uuid4()}.pdf",
         mime_type="application/pdf",
         file_size=100,
@@ -136,9 +143,16 @@ def test_arithmetic_missing_date_tax_and_low_confidence_findings(phase9a_databas
 
 def test_exact_and_probable_duplicate_use_multiple_signals(phase9a_database) -> None:
     with phase9a_database() as database:
+        organization = Organization(
+            name="Advanced", slug=uuid.uuid4().hex, plan_code="professional"
+        )
+        database.add(organization)
+        database.flush()
         owner = add_user(database, "duplicates@example.com")
-        original = add_invoice(database, owner, checksum="a" * 64)
-        exact = add_invoice(database, owner, number="OTHER", checksum="a" * 64)
+        original = add_invoice(database, owner, checksum="a" * 64, organization=organization)
+        exact = add_invoice(
+            database, owner, number="OTHER", checksum="a" * 64, organization=organization
+        )
         exact_specs = generate_finding_specs(database, exact)
         assert any(spec.title == "Exact duplicate document detected" for spec in exact_specs)
 
@@ -151,6 +165,7 @@ def test_exact_and_probable_duplicate_use_multiple_signals(phase9a_database) -> 
             vendor=original_extraction.vendor_name,
             invoice_date=original_extraction.invoice_date,
             total="999.00",
+            organization=organization,
         )
         probable_specs = generate_finding_specs(database, probable)
         finding = next(
@@ -162,16 +177,27 @@ def test_exact_and_probable_duplicate_use_multiple_signals(phase9a_database) -> 
 
 def test_amount_anomaly_requires_sufficient_history(phase9a_database) -> None:
     with phase9a_database() as database:
+        organization = Organization(
+            name="Advanced", slug=uuid.uuid4().hex, plan_code="professional"
+        )
+        database.add(organization)
+        database.flush()
         owner = add_user(database, "history@example.com")
         for index in range(4):
-            add_invoice(database, owner, number=f"INV-{index}", total="100.00")
-        small_sample = add_invoice(database, owner, number="SMALL", total="1000.00")
+            add_invoice(
+                database, owner, number=f"INV-{index}", total="100.00", organization=organization
+            )
+        small_sample = add_invoice(
+            database, owner, number="SMALL", total="1000.00", organization=organization
+        )
         assert not any(
             finding.category == AIFindingCategory.AMOUNT
             for finding in generate_finding_specs(database, small_sample)
         )
-        add_invoice(database, owner, number="FIFTH", total="100.00")
-        adequate = add_invoice(database, owner, number="OUTLIER", total="1000.00")
+        add_invoice(database, owner, number="FIFTH", total="100.00", organization=organization)
+        adequate = add_invoice(
+            database, owner, number="OUTLIER", total="1000.00", organization=organization
+        )
         finding = next(
             finding
             for finding in generate_finding_specs(database, adequate)
@@ -199,6 +225,25 @@ def test_analysis_is_idempotent_and_preserves_review_state(phase9a_database) -> 
         assert len(second) == 1
         assert second[0].status == AIFindingStatus.ACKNOWLEDGED
         assert document.ai_analysis_status == AIAnalysisStatus.COMPLETED
+
+
+def test_financial_validation_summary_has_stable_statuses(phase9a_database) -> None:
+    with phase9a_database() as database:
+        owner = add_user(database, "financial-status@example.com")
+        valid = add_invoice(database, owner)
+        analyze_document(database, valid)
+        database.commit()
+        assert financial_validation_summary(valid.invoice_extraction, valid.ai_findings) == (
+            "PASSED",
+            {"passed": 1, "warning": 0, "failed": 0},
+        )
+
+        invalid = add_invoice(database, owner, subtotal="100.00", tax="20.00", total="125.00")
+        analyze_document(database, invalid)
+        database.commit()
+        assert financial_validation_summary(invalid.invoice_extraction, invalid.ai_findings)[0] == (
+            "FAILED"
+        )
 
 
 @pytest.fixture
@@ -273,6 +318,24 @@ def test_cross_user_findings_and_document_analysis_are_isolated(phase9a_client) 
     }
     assert str(private.id) in other_ids
     assert str(first.id) not in other_ids
+
+
+def test_document_analysis_exposes_financial_and_anomaly_contract(phase9a_client) -> None:
+    client, _, _, _, _, first, _ = phase9a_client
+    response = client.get(f"/documents/{first.id}/ai-analysis")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["financial_validation_status"] == "WARNING"
+    assert payload["financial_validation_counts"] == {"passed": 0, "warning": 1, "failed": 0}
+    finding = next(
+        item for item in payload["findings"] if item["category"] == "missing_information"
+    )
+    assert finding["severity"] == "medium"
+    assert finding["explanation"]
+    assert finding["evidence"]["missing_fields"] == ["invoice_number"]
+    assert finding["observed_value"] is None
+    assert finding["expected_value"] is None
+    assert finding["status"] == "open"
 
 
 def test_analytics_kpis_multi_currency_trends_and_filters(phase9a_client) -> None:

@@ -2,13 +2,19 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import select
 
 from apps.api.app.invoice_extractor import extract_invoice_fields
-from apps.api.app.models import Document, DocumentStatus
+from apps.api.app.models import (
+    Document,
+    DocumentStatus,
+    ProcessingOperation,
+    ProcessingOperationStatus,
+)
 from apps.api.app.queue import DocumentProcessingQueue, QueueOperationError
 from apps.api.app.settings import settings
 from apps.api.app.text_extraction import (
@@ -16,8 +22,10 @@ from apps.api.app.text_extraction import (
     DocumentTextExtractor,
     PdfTextExtractor,
 )
+from apps.api.app.usage import account_successful_processing, mark_processing_failed
 
 logger = logging.getLogger(__name__)
+MAX_PROCESSING_ATTEMPTS = 3
 
 
 class WorkerOperationError(RuntimeError):
@@ -25,7 +33,13 @@ class WorkerOperationError(RuntimeError):
 
 
 class DocumentDatabase(Protocol):
-    def get(self, entity: type[Document], ident: uuid.UUID, /) -> Document | None: ...
+    def get(self, entity: type[Any], ident: uuid.UUID, /) -> Any: ...
+
+    def scalar(self, statement) -> Any: ...
+
+    def add(self, instance: Any) -> None: ...
+
+    def flush(self) -> None: ...
 
     def commit(self) -> None: ...
 
@@ -55,6 +69,9 @@ class DocumentProcessingWorker:
             return False
 
         try:
+            if not self._record_attempt(payload):
+                self.queue.acknowledge(payload)
+                return False
             result = self._process_payload(payload)
         except Exception:
             self.queue.release(payload)
@@ -62,12 +79,36 @@ class DocumentProcessingWorker:
         self.queue.acknowledge(payload)
         return result
 
+    def _record_attempt(self, payload: str | bytes) -> bool:
+        job = self._parse_job(payload)
+        if job is None or len(job) < 3 or not hasattr(self.database, "flush"):
+            return True
+        operation = self.database.get(ProcessingOperation, job[2])
+        if operation is None:
+            return True
+        operation.retry_attempts += 1
+        if operation.retry_attempts > MAX_PROCESSING_ATTEMPTS:
+            document = self.database.get(Document, job[0])
+            operation.status = ProcessingOperationStatus.FAILED
+            operation.failed_at = datetime.now(UTC)
+            operation.error_details = "Processing retry limit exhausted."
+            if document is not None and document.status is DocumentStatus.QUEUED:
+                document.transition_to(DocumentStatus.PROCESSING)
+                document.transition_to(DocumentStatus.FAILED)
+                document.error_details = "Processing retry limit exhausted."
+            self.database.commit()
+            return False
+        self.database.commit()
+        return True
+
     def _process_payload(self, payload: str | bytes) -> bool:
 
-        document_id = self._parse_document_id(payload)
-        if document_id is None:
+        job = self._parse_job(payload)
+        if job is None:
             logger.warning("document_job_invalid payload=%r", payload)
             return False
+        document_id, job_organization_id = job[:2]
+        operation_id = job[2] if len(job) == 3 else None
 
         logger.info("document_job_received document_id=%s", document_id)
 
@@ -85,8 +126,22 @@ class DocumentProcessingWorker:
             )
             return False
 
+        if document.organization_id != job_organization_id:
+            logger.warning("document_job_tenant_mismatch document_id=%s", document_id)
+            return False
+
         try:
             document.transition_to(DocumentStatus.PROCESSING)
+            if operation_id is not None and hasattr(self.database, "add"):
+                operation = self.database.get(ProcessingOperation, operation_id)
+                if (
+                    operation is None
+                    or operation.document_id != document.id
+                    or operation.organization_id != document.organization_id
+                ):
+                    self.database.rollback()
+                    return False
+                operation.status = ProcessingOperationStatus.PROCESSING
             self.database.commit()
             logger.info("document_processing_started document_id=%s", document_id)
         except Exception as error:
@@ -123,16 +178,27 @@ class DocumentProcessingWorker:
                 line_item.position = position
             document.invoice_extraction = invoice_extraction
             document.transition_to(DocumentStatus.COMPLETED)
+            if operation_id is not None and hasattr(self.database, "add"):
+                account_successful_processing(cast(Any, self.database), document, operation_id)
             self.database.commit()
+            if document.organization_id is not None and hasattr(self.database, "scalars"):
+                from apps.api.app.api_access import emit_document_event
+
+                emit_document_event(
+                    cast(Any, self.database),
+                    document.organization_id,
+                    "document.processing.completed",
+                    {"document_id": str(document.id), "status": document.status.value},
+                )
             logger.info("document_processing_completed document_id=%s", document_id)
         except DocumentTextExtractionError as error:
             self.database.rollback()
-            self._mark_failed(document, str(error))
+            self._mark_failed(document, str(error), operation_id)
             return False
         except Exception:
             self.database.rollback()
             logger.exception("document_processing_unexpected_failure document_id=%s", document_id)
-            self._mark_failed(document, "Unexpected document processing failure.")
+            self._mark_failed(document, "Unexpected document processing failure.", operation_id)
             return False
 
         if self.analyzer is not None:
@@ -167,11 +233,16 @@ class DocumentProcessingWorker:
         recovered_documents = 0
         try:
             for payload in payloads:
-                document_id = self._parse_document_id(payload)
-                if document_id is None:
+                job = self._parse_job(payload)
+                if job is None:
                     continue
+                document_id, job_organization_id = job[:2]
                 document = self.database.get(Document, document_id)
-                if document is not None and document.status is DocumentStatus.PROCESSING:
+                if (
+                    document is not None
+                    and document.organization_id == job_organization_id
+                    and document.status is DocumentStatus.PROCESSING
+                ):
                     document.transition_to(DocumentStatus.QUEUED)
                     recovered_documents += 1
             if recovered_documents:
@@ -199,16 +270,56 @@ class DocumentProcessingWorker:
             self.database.rollback()
             raise WorkerOperationError("Unable to reconcile queued documents.") from error
 
-        enqueued = sum(self.queue.enqueue_if_missing(document_id) for document_id in document_ids)
+        enqueued = 0
+        for document_id in document_ids:
+            document = self.database.get(Document, document_id)
+            if document is not None:
+                operation_id = None
+                operation_priority = "normal"
+                if hasattr(self.database, "scalar"):
+                    operation = self.database.scalar(
+                        select(ProcessingOperation)
+                        .where(
+                            ProcessingOperation.document_id == document.id,
+                            ProcessingOperation.status.in_(
+                                {
+                                    ProcessingOperationStatus.QUEUED,
+                                    ProcessingOperationStatus.PROCESSING,
+                                }
+                            ),
+                        )
+                        .order_by(ProcessingOperation.created_at.desc())
+                    )
+                    operation_id = operation.id if operation is not None else None
+                    if operation is not None:
+                        operation_priority = getattr(
+                            operation.priority, "value", operation.priority
+                        )
+                enqueued += self.queue.enqueue_if_missing(
+                    document_id, document.organization_id, operation_id, operation_priority
+                )
         if enqueued:
             logger.warning("document_jobs_reconciled jobs=%s", enqueued)
         return enqueued
 
-    def _mark_failed(self, document: Document, error_details: str) -> None:
+    def _mark_failed(
+        self, document: Document, error_details: str, operation_id: uuid.UUID | None = None
+    ) -> None:
         try:
             document.transition_to(DocumentStatus.FAILED)
             document.error_details = error_details
+            if operation_id is not None and hasattr(self.database, "add"):
+                mark_processing_failed(cast(Any, self.database), operation_id, error_details)
             self.database.commit()
+            if document.organization_id is not None and hasattr(self.database, "scalars"):
+                from apps.api.app.api_access import emit_document_event
+
+                emit_document_event(
+                    cast(Any, self.database),
+                    document.organization_id,
+                    "document.processing.failed",
+                    {"document_id": str(document.id), "status": document.status.value},
+                )
             logger.error(
                 "document_processing_failed document_id=%s error=%s",
                 document.id,
@@ -255,10 +366,23 @@ class DocumentProcessingWorker:
 
     @staticmethod
     def _parse_document_id(payload: str | bytes) -> uuid.UUID | None:
+        job = DocumentProcessingWorker._parse_job(payload)
+        return job[0] if job is not None else None
+
+    @staticmethod
+    def _parse_job(
+        payload: str | bytes,
+    ) -> tuple[uuid.UUID, uuid.UUID | None] | tuple[uuid.UUID, uuid.UUID | None, uuid.UUID] | None:
         try:
             decoded_payload = payload.decode() if isinstance(payload, bytes) else payload
-            document_id = json.loads(decoded_payload)["document_id"]
-            return uuid.UUID(document_id)
+            data = json.loads(decoded_payload)
+            document_id = uuid.UUID(data["document_id"])
+            organization_id = data.get("organization_id")
+            parsed_organization_id = uuid.UUID(organization_id) if organization_id else None
+            operation_id = data.get("operation_id")
+            if operation_id:
+                return document_id, parsed_organization_id, uuid.UUID(operation_id)
+            return document_id, parsed_organization_id
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -304,6 +428,16 @@ if __name__ == "__main__":
             ):
                 worker.reconcile_queued_documents()
                 last_reconciliation = time.monotonic()
+            from apps.api.app.api_access import retry_due_webhook_deliveries
+
+            retry_due_webhook_deliveries(cast(Any, database))
+            from apps.api.app.email_outbox import process_email
+
+            try:
+                process_email(database)
+            except Exception:
+                database.rollback()
+                logger.warning("transactional_email_worker_unavailable")
             worker.process_once()
         except Exception as error:
             logger.exception("document_worker_error error=%s", error)

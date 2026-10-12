@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 from apps.api.app.auth import get_current_user
 from apps.api.app.database import get_db
@@ -21,6 +22,17 @@ from apps.api.app.models import (
 )
 from apps.api.app.queue import QueueOperationError, get_document_processing_queue
 from apps.api.app.settings import settings
+
+
+def valid_pdf(page_count: int = 1) -> bytes:
+    import io
+
+    writer = PdfWriter()
+    for _ in range(page_count):
+        writer.add_blank_page(width=100, height=100)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 class FakeDatabase:
@@ -209,7 +221,7 @@ def test_upload_document_persists_metadata_and_file(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(settings, "max_upload_size", 1024)
     app.dependency_overrides[get_db] = lambda: database
     app.dependency_overrides[get_document_processing_queue] = lambda: queue
-    content = b"%PDF-1.4 invoice contents"
+    content = valid_pdf()
 
     try:
         response = TestClient(app).post(
@@ -256,7 +268,7 @@ def test_upload_commits_queued_status_before_publishing_job(tmp_path: Path, monk
     try:
         response = TestClient(app).post(
             "/documents",
-            files={"file": ("invoice.pdf", b"%PDF-1.4 invoice", "application/pdf")},
+            files={"file": ("invoice.pdf", valid_pdf(), "application/pdf")},
         )
     finally:
         app.dependency_overrides.pop(get_db, None)
@@ -302,7 +314,7 @@ def test_upload_document_cleans_up_when_queue_enqueue_fails(tmp_path: Path, monk
     try:
         response = TestClient(app).post(
             "/documents",
-            files={"file": ("invoice.pdf", b"%PDF-1.4 invoice contents", "application/pdf")},
+            files={"file": ("invoice.pdf", valid_pdf(), "application/pdf")},
         )
     finally:
         app.dependency_overrides.pop(get_db, None)
@@ -877,7 +889,7 @@ def test_get_document_file_returns_stored_file(
     database = FakeDatabase()
     document_id = uuid.uuid4()
     stored_file = tmp_path / f"{document_id}.pdf"
-    file_bytes = b"%PDF-1.4 test invoice content"
+    file_bytes = valid_pdf()
     stored_file.write_bytes(file_bytes)
     database.documents.append(
         Document(
@@ -972,7 +984,7 @@ def test_reprocess_document_success(tmp_path: Path, monkeypatch, authenticated_u
     queue = FakeQueue()
     document_id = uuid.uuid4()
     stored_file = tmp_path / f"{document_id}.pdf"
-    stored_file.write_bytes(b"pdf content")
+    stored_file.write_bytes(valid_pdf())
     document = Document(
         id=document_id,
         owner_id=authenticated_user.id,
@@ -1011,7 +1023,7 @@ def test_reprocess_document_rejects_already_queued(
     database = FakeDatabase()
     document_id = uuid.uuid4()
     stored_file = tmp_path / f"{document_id}.pdf"
-    stored_file.write_bytes(b"content")
+    stored_file.write_bytes(valid_pdf())
     database.documents.append(
         Document(
             id=document_id,
@@ -1042,7 +1054,7 @@ def test_reprocess_document_queue_failure_rolls_back_status(
     database = FakeDatabase()
     document_id = uuid.uuid4()
     stored_file = tmp_path / f"{document_id}.pdf"
-    stored_file.write_bytes(b"content")
+    stored_file.write_bytes(valid_pdf())
     document = Document(
         id=document_id,
         owner_id=authenticated_user.id,
@@ -1204,7 +1216,7 @@ def test_upload_rejects_files_over_configured_limit(tmp_path: Path, monkeypatch)
 @pytest.mark.parametrize(
     ("filename", "mime_type", "content", "extension"),
     [
-        ("invoice.pdf", "application/pdf", b"%PDF-1.4 secure", ".pdf"),
+        ("invoice.pdf", "application/pdf", valid_pdf(), ".pdf"),
         ("scan.jpg", "image/jpeg", b"\xff\xd8\xff\xe0jpeg", ".jpg"),
         ("scan.jpeg", "image/jpg", b"\xff\xd8\xff\xe0jpeg", ".jpg"),
         ("scan.png", "image/png", b"\x89PNG\r\n\x1a\npng", ".png"),
@@ -1258,7 +1270,7 @@ def test_upload_sanitizes_dangerous_original_filename(tmp_path: Path, monkeypatc
     try:
         response = TestClient(app).post(
             "/documents",
-            files={"file": ("../../windows\\invoice.pdf", b"%PDF-1.4", "application/pdf")},
+            files={"file": ("../../windows\\invoice.pdf", valid_pdf(), "application/pdf")},
         )
     finally:
         app.dependency_overrides.pop(get_db, None)

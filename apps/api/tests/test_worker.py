@@ -23,8 +23,10 @@ class FakeRedis:
     def __init__(self, payload: str | bytes | None) -> None:
         self.lists: dict[str, list[str | bytes]] = {
             "documents": [] if payload is None else [payload],
+            "documents:priority": [],
             "documents:inflight": [],
         }
+        self.values: dict[str, int] = {}
 
     def lmove(self, source: str, destination: str, wherefrom: str, whereto: str):
         if not self.lists.get(source):
@@ -61,7 +63,27 @@ class FakeRedis:
             return None
 
     def execute_command(self, *args: str | int | bytes):
-        inflight, queue, payload = str(args[3]), str(args[4]), args[5]
+        parts = list(args)
+        if len(parts) >= 7 and parts[0] == "EVAL" and parts[2] == 4:
+            priority_queue, normal_queue, inflight, fairness_key = map(str, parts[3:7])
+            priority_ready = bool(self.lists.get(priority_queue))
+            normal_ready = bool(self.lists.get(normal_queue))
+            streak = self.values.get(fairness_key, 0)
+            if priority_ready and normal_ready and streak >= 5:
+                source = normal_queue
+                self.values[fairness_key] = 0
+            elif priority_ready:
+                source = priority_queue
+                self.values[fairness_key] = streak + 1
+            elif normal_ready:
+                source = normal_queue
+                self.values[fairness_key] = 0
+            else:
+                return None
+            payload = self.lists[source].pop(0)
+            self.lists.setdefault(inflight, []).append(payload)
+            return payload
+        inflight, queue, payload = str(parts[3]), str(parts[4]), parts[5]
         assert isinstance(payload, (str, bytes))
         removed = self.lrem(inflight, 1, payload)
         if removed:
@@ -106,7 +128,15 @@ class FakeDatabase:
             return self.document
         return None
 
+    def add(self, instance) -> None:
+        return None
+
+    def flush(self) -> None:
+        return None
+
     def scalar(self, statement):
+        if "processing_operations" in str(statement):
+            return None
         parameters = statement.compile().params
         document_id = next(
             (value for value in parameters.values() if isinstance(value, uuid.UUID)),
@@ -150,6 +180,41 @@ def make_document(status: DocumentStatus) -> Document:
         created_at=now,
         updated_at=now,
     )
+
+
+def test_worker_rejects_mismatched_organization_before_processing(tmp_path, monkeypatch) -> None:
+    document = make_document(DocumentStatus.QUEUED)
+    document.organization_id = uuid.uuid4()
+    payload = DocumentProcessingQueue.payload_for(document.id, uuid.uuid4())
+    database = FakeDatabase(document)
+    worker = DocumentProcessingWorker(
+        DocumentProcessingQueue(FakeRedis(payload), "documents"), database
+    )
+
+    assert worker.process_once() is False
+    assert document.status is DocumentStatus.QUEUED
+    assert database.commits == 0
+
+
+def test_worker_payload_preserves_organization_context() -> None:
+    document_id = uuid.uuid4()
+    organization_id = uuid.uuid4()
+    payload = DocumentProcessingQueue.payload_for(document_id, organization_id)
+
+    assert DocumentProcessingWorker._parse_job(payload) == (document_id, organization_id)
+    operation_id = uuid.uuid4()
+    operation_payload = DocumentProcessingQueue.payload_for(
+        document_id, organization_id, operation_id
+    )
+    assert DocumentProcessingWorker._parse_job(operation_payload) == (
+        document_id,
+        organization_id,
+        operation_id,
+    )
+    legacy_job = DocumentProcessingWorker._parse_job(
+        DocumentProcessingQueue.payload_for(document_id)
+    )
+    assert legacy_job == (document_id, None)
 
 
 @pytest.fixture(autouse=True)

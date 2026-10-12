@@ -2,6 +2,9 @@ export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localh
   /\/$/,
   "",
 );
+export const PUBLIC_APP_ORIGIN = (
+  import.meta.env.VITE_PUBLIC_APP_URL || window.location.origin
+).replace(/\/$/, "");
 export const AUTHENTICATION_LOST_EVENT = "document-analyzer:authentication-lost";
 
 export class AuthenticationLostError extends Error {
@@ -22,6 +25,14 @@ export function clearStoredToken(): void {
   localStorage.removeItem("document_analyzer_token");
 }
 
+export function setStoredOrganizationId(organizationId: string): void {
+  localStorage.setItem("document_analyzer_organization_id", organizationId);
+}
+
+export function getStoredOrganizationId(): string | null {
+  return localStorage.getItem("document_analyzer_organization_id");
+}
+
 function handleUnauthorizedResponse(response: Response, authenticatedRequest: boolean): boolean {
   if (response.status !== 401 || !authenticatedRequest) return false;
   if (getStoredToken()) {
@@ -37,7 +48,9 @@ export async function authenticatedFetch(
 ): Promise<Response> {
   const headers = new Headers(options.headers);
   const token = getStoredToken();
+  const organizationId = getStoredOrganizationId();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (organizationId) headers.set("X-Organization-ID", organizationId);
   const response = await fetch(`${API_BASE_URL}${path}`, { ...options, headers });
   if (handleUnauthorizedResponse(response, Boolean(token))) throw new AuthenticationLostError();
   return response;
@@ -45,6 +58,7 @@ export async function authenticatedFetch(
 
 export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getStoredToken();
+  const organizationId = getStoredOrganizationId();
   const headers = new Headers(options.headers);
 
   if (!(options.body instanceof FormData)) {
@@ -54,6 +68,7 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
+  if (organizationId) headers.set("X-Organization-ID", organizationId);
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,

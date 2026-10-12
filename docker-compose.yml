@@ -1,12 +1,13 @@
 services:
   storage-init:
-    image: codex_projects-api
+    image: ${INVOXA_API_IMAGE:-invoxa-api:local}
     user: "0:0"
     command: ["sh", "-c", "chown -R app:app /app/storage"]
     volumes:
       - document_storage:/app/storage/documents
 
   api:
+    image: ${INVOXA_API_IMAGE:-invoxa-api:local}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -28,6 +29,7 @@ services:
       OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      APP_COMPONENT: api
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
       AUTH_ACCESS_TOKEN_EXPIRE_MINUTES: ${AUTH_ACCESS_TOKEN_EXPIRE_MINUTES:-60}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:5173","http://127.0.0.1:5173"]}
@@ -60,6 +62,9 @@ services:
       GOOGLE_OAUTH_LOGIN_CODE_EXPIRE_SECONDS: ${GOOGLE_OAUTH_LOGIN_CODE_EXPIRE_SECONDS:-60}
       GOOGLE_OAUTH_RATE_LIMIT: ${GOOGLE_OAUTH_RATE_LIMIT:-20}
       GOOGLE_OAUTH_RATE_WINDOW_SECONDS: ${GOOGLE_OAUTH_RATE_WINDOW_SECONDS:-300}
+      SAML_PUBLIC_BASE_URL: ${SAML_PUBLIC_BASE_URL:-}
+      SCIM_PUBLIC_BASE_URL: ${SCIM_PUBLIC_BASE_URL:-}
+      SAML_XMLSEC_BINARY: ${SAML_XMLSEC_BINARY:-xmlsec1}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -75,7 +80,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')",
+          "import json,os,urllib.request; host=json.loads(os.environ['ALLOWED_HOSTS'])[0]; request=urllib.request.Request('http://127.0.0.1:8000/health/ready',headers={'Host':host}); urllib.request.urlopen(request)",
         ]
       interval: 10s
       timeout: 5s
@@ -84,6 +89,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: ${INVOXA_API_IMAGE:-invoxa-api:local}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -102,7 +108,16 @@ services:
       OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-120}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+      APP_COMPONENT: worker
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY in .env}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+      SMTP_USE_SSL: ${SMTP_USE_SSL:-false}
+      PASSWORD_RESET_DEV_OUTBOX_PATH: ${PASSWORD_RESET_DEV_OUTBOX_PATH:-storage/password-reset-outbox}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -114,7 +129,7 @@ services:
         condition: service_healthy
     command: ["python", "-u", "-m", "apps.api.app.worker"]
     healthcheck:
-      test: ["CMD", "tesseract", "--version"]
+      test: ["CMD", "python", "-m", "apps.api.app.worker_health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -127,6 +142,8 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        VITE_PUBLIC_APP_URL: ${VITE_PUBLIC_APP_URL:-}
+        VITE_BUILD_MODE: ${VITE_BUILD_MODE:-development}
     ports:
       - "${WEB_PORT:-5173}:8080"
     depends_on:
@@ -154,7 +171,7 @@ services:
     restart: "no"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-document_analyzer}
       POSTGRES_USER: ${POSTGRES_USER:-document_analyzer}
@@ -171,7 +188,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "${REDIS_PORT:-6379}:6379"

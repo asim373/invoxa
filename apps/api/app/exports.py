@@ -18,6 +18,7 @@ from apps.api.app.export_service import (
     create_xlsx_export,
 )
 from apps.api.app.models import User
+from apps.api.app.tenant import TenantContext, TenantPermission, require_tenant_permission
 
 router = APIRouter(tags=["exports"])
 logger = logging.getLogger(__name__)
@@ -38,8 +39,9 @@ def export_document_csv(
     document_id: uuid.UUID,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> StreamingResponse:
-    return _csv_export_response(database, current_user, [document_id])
+    return _csv_export_response(database, current_user, [document_id], tenant)
 
 
 @router.post("/exports/csv")
@@ -47,15 +49,24 @@ def export_documents_csv(
     request: CsvExportRequest,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> StreamingResponse:
-    return _csv_export_response(database, current_user, request.document_ids)
+    return _csv_export_response(database, current_user, request.document_ids, tenant)
 
 
 def _csv_export_response(
-    database: Session, current_user: User, document_ids: list[uuid.UUID]
+    database: Session,
+    current_user: User,
+    document_ids: list[uuid.UUID],
+    tenant: TenantContext,
 ) -> StreamingResponse:
     try:
-        export_file = create_csv_export(database, current_user.id, document_ids)
+        export_file = create_csv_export(
+            database,
+            current_user.id,
+            document_ids,
+            tenant.organization.id if tenant.organization is not None else None,
+        )
     except ExportDocumentsNotFoundError:
         logger.warning("export_denied_or_missing format=csv user_id=%s", current_user.id)
         raise HTTPException(
@@ -86,8 +97,9 @@ def export_document_xlsx(
     document_id: uuid.UUID,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> StreamingResponse:
-    return _xlsx_export_response(database, current_user, [document_id])
+    return _xlsx_export_response(database, current_user, [document_id], tenant)
 
 
 @router.post("/exports/xlsx")
@@ -95,15 +107,24 @@ def export_documents_xlsx(
     request: XlsxExportRequest,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> StreamingResponse:
-    return _xlsx_export_response(database, current_user, request.document_ids)
+    return _xlsx_export_response(database, current_user, request.document_ids, tenant)
 
 
 def _xlsx_export_response(
-    database: Session, current_user: User, document_ids: list[uuid.UUID]
+    database: Session,
+    current_user: User,
+    document_ids: list[uuid.UUID],
+    tenant: TenantContext,
 ) -> StreamingResponse:
     try:
-        export_file = create_xlsx_export(database, current_user.id, document_ids)
+        export_file = create_xlsx_export(
+            database,
+            current_user.id,
+            document_ids,
+            tenant.organization.id if tenant.organization is not None else None,
+        )
     except ExportDocumentsNotFoundError:
         logger.warning("export_denied_or_missing format=xlsx user_id=%s", current_user.id)
         raise HTTPException(
@@ -127,8 +148,9 @@ def export_document_json(
     document_id: uuid.UUID,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> JSONResponse:
-    return _json_export_response(database, current_user, [document_id])
+    return _json_export_response(database, current_user, [document_id], tenant)
 
 
 @router.post("/exports/json")
@@ -136,15 +158,24 @@ def export_documents_json(
     request: JsonExportRequest,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> JSONResponse:
-    return _json_export_response(database, current_user, request.document_ids)
+    return _json_export_response(database, current_user, request.document_ids, tenant)
 
 
 def _json_export_response(
-    database: Session, current_user: User, document_ids: list[uuid.UUID]
+    database: Session,
+    current_user: User,
+    document_ids: list[uuid.UUID],
+    tenant: TenantContext,
 ) -> JSONResponse:
     try:
-        payload = create_json_export(database, current_user.id, document_ids)
+        payload = create_json_export(
+            database,
+            current_user.id,
+            document_ids,
+            tenant.organization.id if tenant.organization is not None else None,
+        )
     except ExportDocumentsNotFoundError:
         logger.warning("export_denied_or_missing format=json user_id=%s", current_user.id)
         raise HTTPException(

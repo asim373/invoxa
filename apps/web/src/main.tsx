@@ -1,6 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import "./styles.css";
+import { PricingPage } from "./pricing";
+import { AccountRecovery, CustomerAccount, EmailChangeConfirmation } from "./customer-account";
+import { OrganizationSettings } from "./organization-settings";
 import {
   AUTHENTICATION_LOST_EVENT,
   API_BASE_URL,
@@ -9,6 +12,8 @@ import {
   authenticatedFetch,
   clearStoredToken,
   getStoredToken,
+  PUBLIC_APP_ORIGIN,
+  setStoredOrganizationId,
   setStoredToken,
 } from "./api";
 
@@ -21,7 +26,73 @@ type User = {
   role: "admin" | "reviewer" | "viewer";
   created_at: string;
   updated_at: string;
+  organization_id?: string | null;
+  organization_name?: string | null;
+  membership_role?: TeamRole | null;
+  force_password_change?: boolean;
 };
+
+type TeamMember = {
+  id: string;
+  user_id: string;
+  email: string;
+  role: "owner" | "admin" | "member" | "reviewer" | "viewer";
+  status: string;
+  joined_at: string | null;
+};
+
+type TeamInvitation = {
+  id: string;
+  invited_email: string;
+  role: "owner" | "admin" | "member" | "reviewer" | "viewer";
+  status: string;
+  expires_at: string;
+  invitation_token?: string;
+};
+
+type InvitationPreview = {
+  organization_id: string;
+  organization_name: string;
+  invited_email: string;
+  role: TeamRole;
+  expires_at: string;
+};
+
+type TeamRole = "owner" | "admin" | "member" | "reviewer" | "viewer";
+
+function teamRoleLabel(role: TeamRole): string {
+  const normalizedRole = role.toLowerCase() as TeamRole;
+  if (normalizedRole === "owner") return "Owner";
+  if (normalizedRole === "admin") return "Admin";
+  if (normalizedRole === "member") return "Team Member";
+  return normalizedRole === "reviewer" ? "Legacy Reviewer" : "Legacy Viewer";
+}
+
+function teamErrorMessage(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message : "Something went wrong. Please try again.";
+  if (message.includes("pending invitation"))
+    return "An invitation for this email is already pending.";
+  if (message.includes("already a member"))
+    return "This person is already a member of the workspace.";
+  if (message.includes("active seat limit")) return message;
+  if (message.includes("permission") || message.includes("403"))
+    return "You don't have permission to perform this action.";
+  if (message.includes("not found"))
+    return "That team record is no longer available. Refresh and try again.";
+  return message;
+}
+
+function invitationErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "This invitation is no longer valid.";
+  if (message.includes("email does not match"))
+    return "This invitation was sent to another email address. Sign in with the invited account.";
+  if (message.includes("expired"))
+    return "This invitation has expired. Ask the workspace administrator for a new invitation.";
+  if (message.includes("no longer available") || message.includes("invalid"))
+    return "This invitation is no longer valid.";
+  return message;
+}
 
 type DocumentItem = {
   id: string;
@@ -88,6 +159,19 @@ type AIFinding = {
   created_at: string;
 };
 
+type DocumentAnalysis = {
+  document_id: string;
+  analysis_status: "pending" | "completed" | "failed";
+  analysis_error: string | null;
+  analyzed_at: string | null;
+  risk_level: "clear" | "review" | "high";
+  summary: string;
+  counts: Record<string, number>;
+  financial_validation_status: "PASSED" | "WARNING" | "FAILED";
+  financial_validation_counts: Record<string, number>;
+  findings: AIFinding[];
+};
+
 type CurrencyTotal = { currency: string; total: string; tax: string; average: string };
 type Analytics = {
   kpis: {
@@ -113,9 +197,21 @@ type Analytics = {
 };
 
 type ReportType = "financial" | "ai-analysis" | "processing-quality";
-type WorkspaceView = "overview" | "ai-analysis" | "reports" | "documents";
+type WorkspaceView = "overview" | "ai-analysis" | "reports" | "documents" | "company" | "team" | "usage" | "account";
 
-type AuthMode = "login" | "register" | "forgot" | "reset";
+type UsageSnapshot = {
+  plan: { code: string; name: string };
+  processing: {
+    period: string;
+    used_pages: number;
+    limit_pages: number;
+    remaining_pages: number;
+  };
+  seats: { used: number; limit: number; remaining: number };
+  storage: { used_bytes: number; limit_bytes: number; remaining_bytes: number };
+};
+
+type AuthMode = "login" | "register" | "forgot" | "reset" | "google_onboarding";
 
 export const DOCUMENT_POLL_INTERVAL_MS = 1500;
 
@@ -123,6 +219,107 @@ function formatFileSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatUsageBytes(bytes: number) {
+  const value = Math.max(0, bytes);
+  if (value < 1000) return `${value} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = value;
+  let unit = units[0];
+  for (const candidate of units) {
+    scaled /= 1000;
+    unit = candidate;
+    if (scaled < 1000 || candidate === units[units.length - 1]) break;
+  }
+  return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${unit}`;
+}
+
+function formatUsagePeriod(period: string) {
+  const date = new Date(`${period}-01T00:00:00Z`);
+  return Number.isNaN(date.getTime())
+    ? period
+    : date.toLocaleDateString(undefined, { month: "long", year: "numeric", timeZone: "UTC" });
+}
+
+const FINANCIAL_FINDING_CATEGORIES = new Set([
+  "arithmetic_anomaly",
+  "missing_information",
+  "tax_consistency",
+  "date_anomaly",
+  "low_confidence_extraction",
+]);
+
+function findingCategoryLabel(category: string) {
+  return category.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function findingDisplayLabel(finding: AIFinding) {
+  if (finding.category === "duplicate_invoice") return "Possible duplicate";
+  if (finding.category === "unusual_amount") return "Unusual amount";
+  if (finding.category === "vendor_pattern") return "Vendor pattern";
+  return findingCategoryLabel(finding.category);
+}
+
+function isUsageSnapshot(value: unknown): value is UsageSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Record<string, unknown>;
+  const hasMetric = (metric: unknown, keys: string[]) =>
+    !!metric &&
+    typeof metric === "object" &&
+    keys.every((key) => typeof (metric as Record<string, unknown>)[key] === "number");
+  return (
+    !!snapshot.plan &&
+    typeof snapshot.plan === "object" &&
+    typeof (snapshot.plan as Record<string, unknown>).name === "string" &&
+    typeof (snapshot.plan as Record<string, unknown>).code === "string" &&
+    hasMetric(snapshot.processing, ["used_pages", "limit_pages", "remaining_pages"]) &&
+    typeof (snapshot.processing as Record<string, unknown>).period === "string" &&
+    hasMetric(snapshot.seats, ["used", "limit", "remaining"]) &&
+    hasMetric(snapshot.storage, ["used_bytes", "limit_bytes", "remaining_bytes"])
+  );
+}
+
+function UsageMetric({
+  label,
+  used,
+  limit,
+  remaining,
+  unit,
+  formatValue = (value) => String(value),
+}: {
+  label: string;
+  used: number;
+  limit: number;
+  remaining: number;
+  unit?: string;
+  formatValue?: (value: number) => string;
+}) {
+  const percentage =
+    limit > 0 ? Math.min(100, Math.max(0, (used / limit) * 100)) : used > 0 ? 100 : 0;
+  const atLimit = used >= limit && limit >= 0;
+  return (
+    <article className="usage-card">
+      <div className="usage-card-heading">
+        <h3>{label}</h3>
+        {atLimit && <span className="usage-status">Limit reached</span>}
+      </div>
+      <p className="usage-value">
+        <strong>{formatValue(used)}</strong>{" "}
+        <span>
+          of {formatValue(limit)}
+          {unit ? ` ${unit}` : ""}
+        </span>
+      </p>
+      <div className="usage-progress-track" aria-hidden="true">
+        <span style={{ width: `${percentage}%` }} />
+      </div>
+      <p className="usage-remaining">
+        {formatValue(Math.max(0, remaining))}
+        {unit ? ` ${unit}` : ""} remaining
+      </p>
+    </article>
+  );
 }
 
 function formatDate(value: string) {
@@ -283,6 +480,7 @@ function ReportPreview({
 }
 
 const workspaceLabels: Record<WorkspaceView, { title: string; description: string }> = {
+  account: { title: "Account settings", description: "Manage your profile and login security." },
   overview: {
     title: "Overview",
     description: "Monitor invoice performance, review exposure, and business trends.",
@@ -299,10 +497,23 @@ const workspaceLabels: Record<WorkspaceView, { title: string; description: strin
     title: "Documents",
     description: "Manage and analyze your documents and invoices.",
   },
+  team: {
+    title: "Team",
+    description: "Manage members, roles, and workspace access.",
+  },
+  company: {
+    title: "Company settings",
+    description: "Manage your company profile and workspace identity.",
+  },
+  usage: {
+    title: "Plan & Usage",
+    description: "Review your workspace plan and current usage allowances.",
+  },
 };
 
 function NavigationIcon({ view }: { view: WorkspaceView }) {
   const paths: Record<WorkspaceView, React.ReactNode> = {
+    account: <><circle cx="12" cy="8" r="4" /><path d="M5 21v-2a7 7 0 0 1 14 0v2" /></>,
     overview: (
       <>
         <path d="M3 12 12 4l9 8" />
@@ -326,6 +537,24 @@ function NavigationIcon({ view }: { view: WorkspaceView }) {
       <>
         <path d="M5 3h10l4 4v14H5z" />
         <path d="M14 3v5h5M8 13h8M8 17h6" />
+      </>
+    ),
+    team: (
+      <>
+        <circle cx="9" cy="8" r="3" />
+        <circle cx="17" cy="9" r="2.5" />
+        <path d="M3 20c.8-3.1 2.8-4.7 6-4.7s5.2 1.6 6 4.7M15 15c3 .2 4.8 1.8 5.5 4.5" />
+      </>
+    ),
+    company: (
+      <>
+        <path d="M3 21h18M5 21V7l7-4 7 4v14M9 21v-5h6v5M8 9h.01M12 9h.01M16 9h.01M8 12h.01M16 12h.01" />
+      </>
+    ),
+    usage: (
+      <>
+        <path d="M4 19h16" />
+        <path d="M6 16v-3M10 16V9M14 16V6M18 16v-5" />
       </>
     ),
   };
@@ -368,20 +597,140 @@ function GoogleMark() {
   );
 }
 
+function CopyIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="copy-icon"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="8" y="8" width="11" height="11" rx="2" />
+      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="copy-icon"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m5 12 4 4L19 6" />
+    </svg>
+  );
+}
+
+function TeamAlertIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="team-alert-icon"
+      data-testid="team-alert-icon"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M10.3 3.8 2.2 18a2 2 0 0 0 1.7 3h16.2a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0Z" />
+      <path d="M12 9v4M12 17h.01" />
+    </svg>
+  );
+}
+
+function TeamSuccessIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      className="team-alert-icon"
+      data-testid="team-success-icon"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8 12 2.5 2.5L16 9" />
+    </svg>
+  );
+}
+
 export function App() {
   const [token, setToken] = useState(getStoredToken);
   const [user, setUser] = useState<User | null>(null);
 
-  const resetToken = new URLSearchParams(window.location.search).get("token") ?? "";
+  const inviteRoute = window.location.pathname === "/invite/accept";
+  const pricingRoute = window.location.pathname === "/pricing";
+  const resetToken = inviteRoute
+    ? ""
+    : (new URLSearchParams(window.location.search).get("token") ?? "");
+  const invitationToken = inviteRoute
+    ? (new URLSearchParams(window.location.search).get("token") ?? "")
+    : "";
   const googleLoginCode = new URLSearchParams(window.location.search).get("google_code") ?? "";
   const googleAuthError = new URLSearchParams(window.location.search).get("google_error") ?? "";
-  const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
+  const samlCallback = new URLSearchParams(window.location.hash.slice(1));
+  const samlLoginCode = samlCallback.get("saml_code") ?? "";
+  const samlAuthError = samlCallback.get("saml_error") ?? "";
+  const googleInvitation =
+    new URLSearchParams(window.location.search).get("google_invitation") === "1";
+  const googleInvitationOrganization =
+    new URLSearchParams(window.location.search).get("organization_id") ?? "";
+  const googleOnboardingToken =
+    new URLSearchParams(window.location.search).get("google_onboarding") ?? "";
+  const [authMode, setAuthMode] = useState<AuthMode>(
+    resetToken
+      ? "reset"
+      : googleOnboardingToken
+        ? "google_onboarding"
+        : new URLSearchParams(window.location.search).get("signup") === "1"
+          ? "register"
+          : "login",
+  );
   const [email, setEmail] = useState("");
+  const [verificationPending, setVerificationPending] = useState(
+    window.location.pathname === "/verify-email",
+  );
+  const [verificationToken, setVerificationToken] = useState(() => {
+    const value = window.location.pathname === "/verify-email"
+      ? new URLSearchParams(window.location.search).get("token") ?? "" : "";
+    return value;
+  });
+  useEffect(() => {
+    if (verificationToken) window.history.replaceState({}, "", "/verify-email");
+  }, [verificationToken]);
+  const [companyName, setCompanyName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordChangeRequired, setPasswordChangeRequired] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [googleEnabled, setGoogleEnabled] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(Boolean(googleLoginCode));
+  const [samlLoading, setSamlLoading] = useState(Boolean(samlLoginCode));
+  const [samlEntryOpen, setSamlEntryOpen] = useState(false);
+  const [samlOrganizationSlug, setSamlOrganizationSlug] = useState("");
+  const [invitationPreview, setInvitationPreview] = useState<InvitationPreview | null>(null);
+  const [invitationLoading, setInvitationLoading] = useState(Boolean(invitationToken));
+  const [invitationError, setInvitationError] = useState("");
+  const [invitationSuccess, setInvitationSuccess] = useState("");
+  const [invitationMode, setInvitationMode] = useState<"choose" | "new" | "login">("choose");
+  const [invitationPassword, setInvitationPassword] = useState("");
+  const invitationAccepted = useRef(false);
 
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [documentTotal, setDocumentTotal] = useState(0);
@@ -395,6 +744,9 @@ export function App() {
   const [sortDirection, setSortDirection] = useState("desc");
   const [selectedDocumentIds, setSelectedDocumentIds] = useState<Set<string>>(new Set());
   const [selectedDocument, setSelectedDocument] = useState<DocumentDetail | null>(null);
+  const [documentAnalysis, setDocumentAnalysis] = useState<DocumentAnalysis | null>(null);
+  const [documentAnalysisLoading, setDocumentAnalysisLoading] = useState(false);
+  const [documentAnalysisError, setDocumentAnalysisError] = useState("");
 
   const [loading, setLoading] = useState(false);
   const [documentsLoading, setDocumentsLoading] = useState(false);
@@ -420,13 +772,49 @@ export function App() {
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DocumentItem | null>(null);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [teamInvitations, setTeamInvitations] = useState<TeamInvitation[]>([]);
+  const [teamSearch, setTeamSearch] = useState("");
+  const [teamLoading, setTeamLoading] = useState(false);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"admin" | "member">("member");
+  const [teamError, setTeamError] = useState("");
+  const [teamSuccess, setTeamSuccess] = useState("");
+  const [newLinkInvitationId, setNewLinkInvitationId] = useState<string | null>(null);
+  const [copiedInvitationId, setCopiedInvitationId] = useState<string | null>(null);
+  const [invitationLink, setInvitationLink] = useState<{
+    id: string;
+    email: string;
+    url: string;
+  } | null>(null);
+  const [teamAction, setTeamAction] = useState<
+    | { kind: "role"; member: TeamMember }
+    | { kind: "deactivate"; member: TeamMember }
+    | { kind: "reset"; member: TeamMember }
+    | { kind: "revoke"; invitation: TeamInvitation }
+    | null
+  >(null);
+  const [roleUpdate, setRoleUpdate] = useState<"admin" | "member">("member");
+  const [teamActionLoading, setTeamActionLoading] = useState(false);
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState("");
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const copyResetTimerRef = useRef<number | null>(null);
   const deleteCancelRef = useRef<HTMLButtonElement | null>(null);
   const requestedDocumentId = useRef<string | null>(null);
+
+  useEffect(
+    () => () => {
+      if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!deleteTarget) return;
@@ -446,12 +834,47 @@ export function App() {
   }, [resetToken, token]);
 
   useEffect(() => {
+    if (!invitationToken) return;
+    void apiRequest<InvitationPreview>(
+      `/team/invitations/preview?token=${encodeURIComponent(invitationToken)}`,
+    )
+      .then(setInvitationPreview)
+      .catch((requestError: unknown) => setInvitationError(invitationErrorMessage(requestError)))
+      .finally(() => setInvitationLoading(false));
+  }, [invitationToken]);
+
+  useEffect(() => {
+    if (!invitationToken || !token || !user || !invitationPreview || invitationAccepted.current)
+      return;
+    invitationAccepted.current = true;
+    void apiRequest(`/team/invitations/accept`, {
+      method: "POST",
+      body: JSON.stringify({ token: invitationToken }),
+    })
+      .then(() => {
+        setStoredOrganizationId(invitationPreview.organization_id);
+        setInvitationSuccess(`You're now a member of ${invitationPreview.organization_name}.`);
+        window.history.replaceState({}, "", "/");
+        setTimeout(() => window.location.assign("/"), 700);
+      })
+      .catch((requestError: unknown) => {
+        invitationAccepted.current = false;
+        setInvitationError(invitationErrorMessage(requestError));
+      });
+  }, [invitationPreview, invitationToken, token, user]);
+
+  useEffect(() => {
     if (token || resetToken) return;
     if (googleAuthError) {
       const messages: Record<string, string> = {
         cancelled: "Google sign-in was cancelled.",
         invalid_state: "Google sign-in session expired. Please try again.",
         account_unavailable: "This account is not available for sign-in.",
+        company_name_required: "Complete company setup before signing in with Google.",
+        invitation_email_mismatch:
+          "This invitation was sent to another email address. Retry with the invited Google account.",
+        invitation_invalid:
+          "This invitation is no longer valid. Ask the workspace administrator for a new invitation.",
         failed: "Unable to sign in with Google. Please try again.",
       };
       setError(messages[googleAuthError] ?? messages.failed);
@@ -467,6 +890,9 @@ export function App() {
       .then((result) => {
         window.history.replaceState({}, "", window.location.pathname);
         setStoredToken(result.access_token);
+        if (googleInvitation && googleInvitationOrganization) {
+          setStoredOrganizationId(googleInvitationOrganization);
+        }
         setToken(result.access_token);
       })
       .catch((requestError: unknown) => {
@@ -478,7 +904,44 @@ export function App() {
         );
       })
       .finally(() => setGoogleLoading(false));
-  }, [googleAuthError, googleLoginCode, resetToken, token]);
+  }, [
+    googleAuthError,
+    googleInvitation,
+    googleInvitationOrganization,
+    googleLoginCode,
+    resetToken,
+    token,
+  ]);
+
+  useEffect(() => {
+    if (token || resetToken) return;
+    if (samlAuthError) {
+      setError(
+        samlAuthError === "unavailable"
+          ? "Workspace SSO is unavailable. Check the workspace slug or contact its administrator."
+          : "SAML sign-in could not be completed. Please try again or contact your workspace administrator.",
+      );
+      window.history.replaceState({}, "", window.location.pathname);
+      return;
+    }
+    if (!samlLoginCode) return;
+    setSamlLoading(true);
+    void apiRequest<{ access_token: string; organization_id: string }>("/auth/saml/exchange", {
+      method: "POST",
+      body: JSON.stringify({ code: samlLoginCode }),
+    })
+      .then((result) => {
+        window.history.replaceState({}, "", window.location.pathname);
+        setStoredOrganizationId(result.organization_id);
+        setStoredToken(result.access_token);
+        setToken(result.access_token);
+      })
+      .catch(() => {
+        window.history.replaceState({}, "", window.location.pathname);
+        setError("SAML sign-in could not be completed. Please sign in again.");
+      })
+      .finally(() => setSamlLoading(false));
+  }, [resetToken, samlAuthError, samlLoginCode, token]);
 
   useEffect(() => {
     return () => {
@@ -503,7 +966,15 @@ export function App() {
   async function loadCurrentUser() {
     try {
       const currentUser = await apiRequest<User>("/auth/me");
+      if (
+        currentUser.organization_id &&
+        !localStorage.getItem("document_analyzer_organization_id")
+      ) {
+        setStoredOrganizationId(currentUser.organization_id);
+        void loadDocuments();
+      }
       setUser(currentUser);
+      setPasswordChangeRequired(Boolean(currentUser.force_password_change));
     } catch {
       clearStoredToken();
       setToken(null);
@@ -604,29 +1075,58 @@ export function App() {
     setSuccess("");
 
     try {
-      if (authMode === "register") {
-        await apiRequest<User>("/auth/register", {
+      if (authMode === "google_onboarding") {
+        const onboarding = await apiRequest<{ google_code: string; organization_id: string }>(
+          "/auth/google/complete-onboarding",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              onboarding_token: googleOnboardingToken,
+              company_name: companyName,
+            }),
+          },
+        );
+        setStoredOrganizationId(onboarding.organization_id);
+        const data = await apiRequest<{ access_token: string }>("/auth/google/exchange", {
           method: "POST",
-          body: JSON.stringify({
-            email,
-            password,
-          }),
+          body: JSON.stringify({ code: onboarding.google_code }),
         });
+        window.history.replaceState({}, "", window.location.pathname);
+        setStoredToken(data.access_token);
+        setToken(data.access_token);
+      } else if (authMode === "register") {
+        const registration = await apiRequest<User & { organization_id: string }>(
+          "/auth/register",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              email,
+              password,
+              company_name: companyName,
+            }),
+          },
+        );
+        setStoredOrganizationId(registration.organization_id);
 
-        setSuccess("Account created. You can now sign in.");
+        setSuccess("Account created. Check your email to verify your address before signing in.");
+        setVerificationPending(true);
         setAuthMode("login");
         setPassword("");
       } else {
-        const data = await apiRequest<{ access_token: string }>("/auth/login", {
-          method: "POST",
-          body: JSON.stringify({
-            email,
-            password,
-          }),
-        });
+        const data = await apiRequest<{ access_token: string; password_change_required?: boolean }>(
+          "/auth/login",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              email,
+              password,
+            }),
+          },
+        );
 
         setStoredToken(data.access_token);
         setToken(data.access_token);
+        setPasswordChangeRequired(Boolean(data.password_change_required));
         setPassword("");
       }
     } catch (requestError) {
@@ -643,6 +1143,20 @@ export function App() {
     setConfirmPassword("");
     setError("");
     setSuccess("");
+  }
+
+  function startSamlSignIn(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const slug = samlOrganizationSlug.trim();
+    if (!/^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(slug)) {
+      setError("Enter the workspace slug provided by your administrator.");
+      return;
+    }
+    setError("");
+    const query = new URLSearchParams({ return_path: "/saml-login" });
+    window.location.assign(
+      `${API_BASE_URL}/auth/saml/${encodeURIComponent(slug)}/start?${query.toString()}`,
+    );
   }
 
   async function handleForgotPassword(event: React.FormEvent<HTMLFormElement>) {
@@ -692,10 +1206,40 @@ export function App() {
     }
   }
 
+  async function handleRequiredPasswordChange(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setSuccess("");
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await apiRequest<{ detail: string }>("/auth/change-password", {
+        method: "POST",
+        body: JSON.stringify({ new_password: password }),
+      });
+      clearStoredToken();
+      setToken(null);
+      setUser(null);
+      setPasswordChangeRequired(false);
+      setPassword("");
+      setConfirmPassword("");
+      setSuccess(result.detail);
+      setAuthMode("login");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to change password.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function logout() {
     clearStoredToken();
     setToken(null);
     setUser(null);
+    setPasswordChangeRequired(false);
     setDocuments([]);
     setSelectedDocumentIds(new Set());
     setSelectedDocument(null);
@@ -742,6 +1286,8 @@ export function App() {
     requestedDocumentId.current = documentId;
     setSelectedDocument((current) => (current?.id === documentId ? current : null));
     setPreviewUrl("");
+    setDocumentAnalysis(null);
+    setDocumentAnalysisError("");
     setError("");
     setDetailLoading(true);
 
@@ -751,11 +1297,28 @@ export function App() {
       if (requestedDocumentId.current !== documentId) return;
       setSelectedDocument(data);
       await loadPreview(documentId);
+      await loadDocumentAnalysis(documentId);
     } catch (requestError) {
       if (requestError instanceof AuthenticationLostError) return;
       setError(requestError instanceof Error ? requestError.message : "Unable to open document.");
     } finally {
       setDetailLoading(false);
+    }
+  }
+
+  async function loadDocumentAnalysis(documentId: string) {
+    setDocumentAnalysisLoading(true);
+    setDocumentAnalysisError("");
+    try {
+      const data = await apiRequest<DocumentAnalysis>(`/documents/${documentId}/ai-analysis`);
+      if (requestedDocumentId.current === documentId) setDocumentAnalysis(data);
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationLostError) return;
+      setDocumentAnalysisError(
+        requestError instanceof Error ? requestError.message : "Unable to load analysis.",
+      );
+    } finally {
+      setDocumentAnalysisLoading(false);
     }
   }
 
@@ -975,6 +1538,175 @@ export function App() {
     findingStatus,
   ]);
 
+  async function loadTeam() {
+    setTeamLoading(true);
+    setTeamError("");
+    try {
+      const [members, invitations] = await Promise.all([
+        apiRequest<TeamMember[]>("/team/members"),
+        apiRequest<TeamInvitation[]>("/team/invitations"),
+      ]);
+      setTeamMembers(members);
+      setTeamInvitations(invitations);
+    } catch (requestError) {
+      setTeamError(requestError instanceof Error ? requestError.message : "Unable to load team.");
+    } finally {
+      setTeamLoading(false);
+    }
+  }
+
+  async function loadUsage() {
+    setUsageLoading(true);
+    setUsageError("");
+    try {
+      const data: unknown = await apiRequest<UsageSnapshot>("/organizations/usage");
+      if (!isUsageSnapshot(data)) throw new Error("Usage information is unavailable right now.");
+      setUsage(data);
+    } catch (requestError) {
+      if (requestError instanceof AuthenticationLostError) return;
+      setUsageError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Usage information could not be loaded.",
+      );
+    } finally {
+      setUsageLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (token && user && workspaceView === "team") void loadTeam();
+  }, [token, user, workspaceView]);
+
+  useEffect(() => {
+    if (token && user && workspaceView === "usage") void loadUsage();
+  }, [token, user, user?.organization_id, workspaceView]);
+
+  async function inviteMember(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTeamLoading(true);
+    setTeamError("");
+    setTeamSuccess("");
+    try {
+      const result = await apiRequest<TeamInvitation>("/team/invitations", {
+        method: "POST",
+        body: JSON.stringify({ email: inviteEmail, role: inviteRole }),
+      });
+      setInviteOpen(false);
+      setInviteEmail("");
+      if (result.invitation_token) {
+        setInvitationLink({
+          id: result.id,
+          email: result.invited_email,
+          url: `${PUBLIC_APP_ORIGIN}/invite/accept?token=${encodeURIComponent(result.invitation_token)}`,
+        });
+      }
+      setTeamSuccess(`Invitation sent to ${result.invited_email}.`);
+      await loadTeam();
+    } catch (requestError) {
+      setTeamError(teamErrorMessage(requestError));
+    } finally {
+      setTeamLoading(false);
+    }
+  }
+
+  const currentMembership = teamMembers.find((member) => member.user_id === user?.id);
+  const currentRole = currentMembership?.role ?? user?.membership_role;
+  const canManageTeam = currentRole === "owner" || currentRole === "admin";
+  const canInviteAdmin = currentRole === "owner";
+  const companySearch = teamSearch.trim().toLocaleLowerCase();
+  const filteredTeamMembers = teamMembers.filter((member) =>
+    member.email.toLocaleLowerCase().includes(companySearch),
+  );
+  const filteredTeamInvitations = teamInvitations.filter((invitation) =>
+    invitation.invited_email.toLocaleLowerCase().includes(companySearch),
+  );
+
+  async function runTeamAction() {
+    if (!teamAction) return;
+    setTeamActionLoading(true);
+    setTeamError("");
+    setTeamSuccess("");
+    try {
+      if (teamAction.kind === "role") {
+        await apiRequest(`/team/members/${teamAction.member.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ role: roleUpdate }),
+        });
+        setTeamSuccess("Role updated.");
+      } else if (teamAction.kind === "deactivate") {
+        await apiRequest(`/team/members/${teamAction.member.id}`, { method: "DELETE" });
+        setTeamSuccess(
+          "Workspace access deactivated. The user account and workspace data remain intact.",
+        );
+      } else if (teamAction.kind === "reset") {
+        const result = await apiRequest<{ temporary_password?: string }>(
+          `/team/members/${teamAction.member.id}/password-reset`,
+          {
+            method: "POST",
+          },
+        );
+        setTeamSuccess(
+          result.temporary_password
+            ? `Temporary password (shown once): ${result.temporary_password}`
+            : "Password reset initiated. The current password remains private.",
+        );
+      } else {
+        await apiRequest(`/team/invitations/${teamAction.invitation.id}/revoke`, {
+          method: "POST",
+        });
+        setTeamSuccess("Invitation cancelled. Its existing link will no longer work.");
+      }
+      setTeamAction(null);
+      await loadTeam();
+    } catch (requestError) {
+      setTeamError(teamErrorMessage(requestError));
+    } finally {
+      setTeamActionLoading(false);
+    }
+  }
+
+  async function resendInvitation(invitation: TeamInvitation) {
+    setTeamLoading(true);
+    setTeamError("");
+    try {
+      const result = await apiRequest<TeamInvitation>(`/team/invitations/${invitation.id}/resend`, {
+        method: "POST",
+      });
+      if (result.invitation_token) {
+        setInvitationLink({
+          id: result.id,
+          email: result.invited_email,
+          url: `${PUBLIC_APP_ORIGIN}/invite/accept?token=${encodeURIComponent(result.invitation_token)}`,
+        });
+      }
+      setNewLinkInvitationId(invitation.id);
+      setTeamSuccess(
+        `New invitation link created for ${invitation.invited_email}. The previous link no longer works.`,
+      );
+      await loadTeam();
+    } catch (requestError) {
+      setTeamError(teamErrorMessage(requestError));
+    } finally {
+      setTeamLoading(false);
+    }
+  }
+
+  async function copyInvitationLink(invitationId: string, url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      if (copyResetTimerRef.current !== null) window.clearTimeout(copyResetTimerRef.current);
+      setCopiedInvitationId(invitationId);
+      copyResetTimerRef.current = window.setTimeout(() => {
+        setCopiedInvitationId(null);
+        copyResetTimerRef.current = null;
+      }, 2000);
+      setTeamSuccess("Invitation link copied to your clipboard.");
+    } catch {
+      setTeamError("We couldn't copy the invitation link. Select and copy it manually.");
+    }
+  }
+
   async function updateFindingStatus(
     finding: AIFinding,
     status: "open" | "acknowledged" | "resolved",
@@ -1039,7 +1771,229 @@ export function App() {
     }
   }
 
+  async function acceptNewInvitation(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setInvitationLoading(true);
+    setInvitationError("");
+    try {
+      const result = await apiRequest<{ access_token: string; organization_id: string }>(
+        "/team/invitations/accept-new",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            token: invitationToken,
+            email: invitationPreview?.invited_email,
+            password: invitationPassword,
+          }),
+        },
+      );
+      setStoredToken(result.access_token);
+      setStoredOrganizationId(result.organization_id);
+      setInvitationSuccess(`You're now a member of ${invitationPreview?.organization_name}.`);
+      window.history.replaceState({}, "", "/");
+      setToken(result.access_token);
+    } catch (requestError) {
+      setInvitationError(invitationErrorMessage(requestError));
+    } finally {
+      setInvitationLoading(false);
+    }
+  }
+
+  if (pricingRoute) return <PricingPage />;
+
+  if (inviteRoute && !token && invitationMode !== "login") {
+    return (
+      <main className="auth-page invitation-auth-page">
+        <section className="auth-card invitation-card" aria-labelledby="invite-accept-heading">
+          <img className="auth-logo" src="/invoxa-logo.jpg" alt="Invoxa" />
+          <h1 id="invite-accept-heading">You're invited to join Invoxa</h1>
+          <p className="auth-intro">
+            Upload and process business documents, review extracted information with AI, and export
+            structured invoice data.
+          </p>
+
+          {(authMode === "login" || authMode === "register") && (
+            <a className="auth-plans-link" href="/pricing">Explore plans and pricing</a>
+          )}
+          {invitationLoading && <p role="status">Checking your invitation...</p>}
+          {invitationError && (
+            <div className="alert error" role="alert">
+              {invitationError}
+            </div>
+          )}
+          {invitationSuccess && (
+            <div className="alert success" role="status">
+              {invitationSuccess}
+            </div>
+          )}
+          {invitationPreview && !invitationSuccess && (
+            <>
+              <dl className="invitation-context">
+                <div>
+                  <dt>Workspace</dt>
+                  <dd>{invitationPreview.organization_name}</dd>
+                </div>
+                <div>
+                  <dt>Your role</dt>
+                  <dd>{teamRoleLabel(invitationPreview.role)}</dd>
+                </div>
+              </dl>
+              <p className="invite-copy">
+                Join this workspace to work with its documents and day-to-day invoice operations.
+              </p>
+              {invitationMode === "choose" ? (
+                <div className="invite-actions">
+                  <button
+                    className="primary-button invitation-primary"
+                    type="button"
+                    onClick={() => setInvitationMode("login")}
+                  >
+                    Sign in to accept
+                  </button>
+                  <div className="auth-divider" aria-hidden="true">
+                    OR
+                  </div>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => setInvitationMode("new")}
+                  >
+                    Create account and join
+                  </button>
+                </div>
+              ) : (
+                <form onSubmit={acceptNewInvitation} className="auth-form invite-form">
+                  <label>
+                    Email
+                    <input type="email" value={invitationPreview.invited_email} readOnly />
+                  </label>
+                  <label>
+                    Password
+                    <input
+                      type="password"
+                      minLength={12}
+                      required
+                      value={invitationPassword}
+                      onChange={(event) => setInvitationPassword(event.target.value)}
+                      autoComplete="new-password"
+                    />
+                  </label>
+                  <p className="dialog-help">
+                    Use at least 12 characters. You are joining this workspace; no new company is
+                    created.
+                  </p>
+                  <button
+                    className="primary-button invitation-primary"
+                    disabled={invitationLoading}
+                  >
+                    {invitationLoading ? "Joining..." : "Create account and join"}
+                  </button>
+                </form>
+              )}
+            </>
+          )}
+          {!invitationPreview && !invitationLoading && !invitationError && (
+            <p role="alert">This invitation is no longer valid.</p>
+          )}
+        </section>
+      </main>
+    );
+  }
+
+  if (token && passwordChangeRequired) {
+    return (
+      <main className="auth-page">
+        <section className="auth-card">
+          <img
+            className="auth-logo"
+            src="/invoxa-logo.jpg"
+            alt="Invoxa — Document & Invoice Analyzer"
+          />
+          <h1>Choose your private password</h1>
+          <p className="auth-intro">
+            Your manager provided a temporary password. Choose a private password before using
+            Invoxa.
+          </p>
+          <form onSubmit={handleRequiredPasswordChange} className="auth-form">
+            <label>
+              New password
+              <input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="new-password"
+                minLength={12}
+                required
+              />
+            </label>
+            <label>
+              Confirm password
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+                minLength={12}
+                required
+              />
+            </label>
+            {error && (
+              <div className="alert error" role="alert">
+                {error}
+              </div>
+            )}
+            <button className="primary-button" disabled={loading}>
+              {loading ? "Changing..." : "Change password"}
+            </button>
+          </form>
+        </section>
+      </main>
+    );
+  }
+
   if (!token || !user) {
+    if (verificationPending) {
+      return (
+        <main className="auth-page">
+          <section className="auth-card" aria-labelledby="verification-heading">
+            <img className="auth-logo" src="/invoxa-logo.jpg" alt="Invoxa" />
+            <h1 id="verification-heading">Verify your email address</h1>
+            <p>Confirm your email to securely access your workspace.</p>
+            <form className="auth-form" onSubmit={async (event) => {
+              event.preventDefault(); setLoading(true); setError("");
+              try {
+                if (verificationToken) {
+                  await apiRequest("/auth/verify-email", {
+                    method: "POST", body: JSON.stringify({ token: verificationToken }),
+                  });
+                  setVerificationToken(""); setVerificationPending(false);
+                  setAuthMode("login"); setSuccess("Email verified. You can now sign in.");
+                } else {
+                  await apiRequest("/auth/resend-verification", {
+                    method: "POST", body: JSON.stringify({ email }),
+                  });
+                  setSuccess("If verification is needed, a verification email will be sent.");
+                }
+              } catch (requestError) {
+                setError(requestError instanceof Error ? requestError.message : "Verification unavailable.");
+                setVerificationToken("");
+              } finally { setLoading(false); }
+            }}>
+              {!verificationToken && <label>Email<input type="email" value={email}
+                onChange={(event) => setEmail(event.target.value)} required autoComplete="email" /></label>}
+              {error && <div className="alert error" role="alert">{error}</div>}
+              {success && <div className="alert success" role="status">{success}</div>}
+              <button className="primary-button" disabled={loading}>
+                {loading ? "Please wait..." : verificationToken ? "Verify email" : "Resend verification email"}
+              </button>
+              <button className="text-button" type="button" onClick={() => {
+                setVerificationPending(false); setAuthMode("login");
+              }}>Back to sign in</button>
+            </form>
+          </section>
+        </main>
+      );
+    }
     return (
       <main className="auth-page">
         <section className="auth-card">
@@ -1056,7 +2010,9 @@ export function App() {
                 ? "Create your Invoxa account"
                 : authMode === "forgot"
                   ? "Forgot your password?"
-                  : "Reset your password"}
+                  : authMode === "reset"
+                    ? "Reset your password"
+                    : "Set up your Invoxa workspace"}
           </h1>
 
           <p className="auth-intro">
@@ -1064,12 +2020,14 @@ export function App() {
               ? "Upload and process business documents, review extracted information with AI, and export structured invoice data."
               : authMode === "forgot"
                 ? "Enter your account email and we’ll send password reset instructions."
-                : "Choose a new password with at least 12 characters."}
+                : authMode === "reset"
+                  ? "Choose a new password with at least 12 characters."
+                  : "Choose a company or workspace name to finish setting up your verified Google account."}
           </p>
 
-          {googleLoading && (
+          {(googleLoading || samlLoading) && (
             <div className="alert" role="status">
-              Completing Google sign-in…
+              Completing sign-in…
             </div>
           )}
 
@@ -1092,7 +2050,7 @@ export function App() {
                 </div>
               )}
               <button className="primary-button" disabled={loading}>
-                {loading ? "Sending..." : "Send reset instructions"}
+                {loading ? "Sending..." : "Reset Password"}
               </button>
               <button className="text-button" type="button" onClick={returnToLogin}>
                 Back to sign in
@@ -1135,83 +2093,145 @@ export function App() {
                 Back to sign in
               </button>
             </form>
-          ) : (
+          ) : authMode === "google_onboarding" ? (
             <form onSubmit={handleAuth} className="auth-form">
-              <label htmlFor="auth-email">
-                Email
+              <label htmlFor="google-company-name">
+                Company or workspace name
                 <span className="auth-input-wrap">
                   <input
-                    id="auth-email"
-                    type="email"
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    placeholder="you@example.com"
-                    autoComplete="email"
+                    id="google-company-name"
+                    type="text"
+                    value={companyName}
+                    onChange={(event) => setCompanyName(event.target.value)}
+                    placeholder="Acme Logistics"
+                    autoComplete="organization"
+                    maxLength={255}
                     required
                   />
                 </span>
               </label>
-
-              <label htmlFor="auth-password">
-                Password
-                <span className="auth-input-wrap">
-                  <input
-                    id="auth-password"
-                    aria-label="Password"
-                    type={showPassword ? "text" : "password"}
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    placeholder={
-                      authMode === "register" ? "Minimum 12 characters" : "Your password"
-                    }
-                    autoComplete={authMode === "register" ? "new-password" : "current-password"}
-                    minLength={authMode === "register" ? 12 : 1}
-                    required
-                  />
-                  <button
-                    className="password-toggle"
-                    type="button"
-                    aria-label={showPassword ? "Hide password" : "Show password"}
-                    aria-pressed={showPassword}
-                    onClick={() => setShowPassword((visible) => !visible)}
-                  >
-                    {showPassword ? "Hide" : "Show"}
-                  </button>
-                </span>
-              </label>
-
-              {authMode === "login" && (
-                <div className="auth-options">
-                  <button
-                    className="text-button"
-                    type="button"
-                    onClick={() => {
-                      setAuthMode("forgot");
-                      setError("");
-                      setSuccess("");
-                    }}
-                  >
-                    Forgot password?
-                  </button>
-                </div>
-              )}
-
               {error && (
                 <div className="alert error" role="alert">
                   {error}
                 </div>
               )}
-              {success && (
-                <div className="alert success" role="status">
-                  {success}
-                </div>
-              )}
-
               <button className="primary-button" disabled={loading}>
-                {loading ? "Please wait..." : authMode === "login" ? "Sign in" : "Create account"}
+                {loading ? "Setting up workspace..." : "Continue to Invoxa"}
               </button>
+            </form>
+          ) : (
+            <>
+              <form onSubmit={handleAuth} className="auth-form">
+                {authMode === "register" && (
+                  <label htmlFor="auth-company-name">
+                    Company or workspace name
+                    <span className="auth-input-wrap">
+                      <input
+                        id="auth-company-name"
+                        type="text"
+                        value={companyName}
+                        onChange={(event) => setCompanyName(event.target.value)}
+                        placeholder="Acme Logistics"
+                        autoComplete="organization"
+                        maxLength={255}
+                        required
+                      />
+                    </span>
+                  </label>
+                )}
+                <label htmlFor="auth-email">
+                  Email
+                  <span className="auth-input-wrap">
+                    <input
+                      id="auth-email"
+                      type="email"
+                      value={email}
+                      onChange={(event) => setEmail(event.target.value)}
+                      placeholder="you@example.com"
+                      autoComplete="email"
+                      required
+                    />
+                  </span>
+                </label>
+
+                <label htmlFor="auth-password">
+                  Password
+                  <span className="auth-input-wrap">
+                    <input
+                      id="auth-password"
+                      aria-label="Password"
+                      type={showPassword ? "text" : "password"}
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      placeholder={
+                        authMode === "register" ? "Minimum 12 characters" : "Your password"
+                      }
+                      autoComplete={authMode === "register" ? "new-password" : "current-password"}
+                      minLength={authMode === "register" ? 12 : 1}
+                      required
+                    />
+                    <button
+                      className="password-toggle"
+                      type="button"
+                      aria-label={showPassword ? "Hide password" : "Show password"}
+                      aria-pressed={showPassword}
+                      onClick={() => setShowPassword((visible) => !visible)}
+                    >
+                      {showPassword ? "Hide" : "Show"}
+                    </button>
+                  </span>
+                </label>
+
+                {authMode === "login" && (
+                  <div className="auth-options">
+                    <button
+                      className="text-button"
+                      type="button"
+                      onClick={() => {
+                        setAuthMode("forgot");
+                        setError("");
+                        setSuccess("");
+                      }}
+                    >
+                      Forgot password?
+                    </button>
+                  </div>
+                )}
+
+                {error && (
+                  <div className="alert error" role="alert">
+                    {error}
+                  </div>
+                )}
+                {success && (
+                  <div className="alert success" role="status">
+                    {success}
+                  </div>
+                )}
+
+                <button className="primary-button" disabled={loading}>
+                  {loading ? "Please wait..." : authMode === "login" ? "Sign in" : "Create account"}
+                </button>
+              </form>
               {authMode === "login" && (
-                <>
+                <div className="auth-external-options">
+                  <button
+                    className="text-button"
+                    type="button"
+                    onClick={() => {
+                      setVerificationPending(true);
+                      setVerificationToken("");
+                      setError("");
+                      setSuccess("");
+                    }}
+                  >
+                    Verify email or resend verification
+                  </button>
+                  {samlLoading && (
+                    <div className="alert" role="status">
+                      Completing workspace sign-in...
+                    </div>
+                  )}
                   <div className="auth-divider">
                     <span>or</span>
                   </div>
@@ -1231,7 +2251,35 @@ export function App() {
                       Continue with Google
                     </button>
                   )}
-                </>
+                  <button
+                    className="google-button sso-button"
+                    type="button"
+                    onClick={() => {
+                      setSamlEntryOpen((open) => !open);
+                      setError("");
+                    }}
+                  >
+                    Continue with workspace SSO
+                  </button>
+                  {samlEntryOpen && (
+                    <form className="sso-entry-form" onSubmit={startSamlSignIn}>
+                      <label>
+                        Workspace slug
+                        <input
+                          value={samlOrganizationSlug}
+                          onChange={(event) => setSamlOrganizationSlug(event.target.value)}
+                          autoComplete="organization"
+                          maxLength={63}
+                          placeholder="Provided by your administrator"
+                          required
+                        />
+                      </label>
+                      <button className="primary-button" type="submit">
+                        Continue to SSO
+                      </button>
+                    </form>
+                  )}
+                </div>
               )}
               <p className="auth-switch">
                 {authMode === "login" ? "Don't have an account?" : "Already have an account?"}{" "}
@@ -1248,7 +2296,7 @@ export function App() {
                   {authMode === "login" ? "Create now" : "Sign in"}
                 </button>
               </p>
-            </form>
+            </>
           )}
 
           <p className="security-note">Secure. Private. Built for your business.</p>
@@ -1270,7 +2318,9 @@ export function App() {
           <img src="/invoxa-logo.jpg" alt="Invoxa — Document & Invoice Analyzer" />
         </div>
         <nav className="sidebar-nav" aria-label="Primary workspace">
-          {(["overview", "ai-analysis", "reports", "documents"] as WorkspaceView[]).map((view) => (
+          {(
+            ["overview", "ai-analysis", "reports", "documents", "company", "team", "usage"] as WorkspaceView[]
+          ).map((view) => (
             <button
               className={workspaceView === view ? "active" : ""}
               key={view}
@@ -1294,9 +2344,11 @@ export function App() {
             </span>
             <div>
               <strong>{user.email}</strong>
-              <small>{user.role} workspace</small>
+              <small>{user.organization_name ?? "Workspace"}</small>
             </div>
           </div>
+          <a className="sidebar-plans-link" href="/pricing">Plans & pricing</a>
+          <button className="logout-button" type="button" onClick={() => { setWorkspaceView("account"); setSidebarOpen(false); }}>Account settings</button>
           <button className="logout-button" onClick={logout} type="button">
             <svg
               aria-hidden="true"
@@ -1340,7 +2392,12 @@ export function App() {
           <div className="dashboard-heading">
             <div>
               <p className="eyebrow">Invoxa workspace</p>
-              <h1>{workspaceLabels[workspaceView].title}</h1>
+              <h1
+                id={workspaceView === "team" ? "team-heading" : undefined}
+                className={workspaceView === "team" ? "team-page-title" : undefined}
+              >
+                {workspaceLabels[workspaceView].title}
+              </h1>
               <p>{workspaceLabels[workspaceView].description}</p>
             </div>
 
@@ -1361,6 +2418,476 @@ export function App() {
 
           {error && <div className="alert error">{error}</div>}
           {success && <div className="alert success">{success}</div>}
+
+          {workspaceView === "account" && <CustomerAccount />}
+
+          {workspaceView === "company" && (
+            <OrganizationSettings canEdit={canManageTeam} />
+          )}
+
+          {workspaceView === "team" && (
+            <section className="team-page" aria-labelledby="team-heading">
+              <div className="team-toolbar">
+                <label className="team-search-label" htmlFor="team-search">
+                  <span>Search members and invitations</span>
+                  <input
+                    id="team-search"
+                    type="search"
+                    value={teamSearch}
+                    onChange={(event) => setTeamSearch(event.target.value)}
+                    placeholder="Name or email"
+                  />
+                </label>
+                {canManageTeam && (
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={() => setInviteOpen(true)}
+                  >
+                    Invite member
+                  </button>
+                )}
+              </div>
+              {teamError && (
+                <div className="alert error team-alert" role="alert">
+                  <TeamAlertIcon />
+                  <span>{teamError}</span>
+                </div>
+              )}
+              {teamSuccess && (
+                <div className="alert success team-alert" role="status">
+                  <TeamSuccessIcon />
+                  <span>{teamSuccess}</span>
+                </div>
+              )}
+              {invitationLink && (
+                <div className="invitation-link-panel" role="status">
+                  <div>
+                    <strong>Invitation link for {invitationLink.email}</strong>
+                    <p>Share this link with the invitee. It is only valid for this invitation.</p>
+                  </div>
+                  <div className="invitation-link-controls">
+                    <input
+                      aria-label={`Invitation link for ${invitationLink.email}`}
+                      value={invitationLink.url}
+                      readOnly
+                      onFocus={(event) => event.currentTarget.select()}
+                    />
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label={
+                        copiedInvitationId === invitationLink.id ? "Copied" : "Copy invitation link"
+                      }
+                      title={
+                        copiedInvitationId === invitationLink.id ? "Copied" : "Copy invitation link"
+                      }
+                      onClick={() => void copyInvitationLink(invitationLink.id, invitationLink.url)}
+                    >
+                      {copiedInvitationId === invitationLink.id ? <CheckIcon /> : <CopyIcon />}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {teamLoading ? (
+                <div className="compact-state">Loading team access...</div>
+              ) : (
+                <>
+                  <div className="team-summary">
+                    <div>
+                      <strong>{teamMembers.length}</strong>
+                      <span>Active members</span>
+                    </div>
+                    <div>
+                      <strong>{teamInvitations.length}</strong>
+                      <span>Pending invitations</span>
+                    </div>
+                  </div>
+                  <div className="team-card">
+                    <h3>Members</h3>
+                    {teamMembers.length === 0 ? (
+                      <div className="compact-state">No active members.</div>
+                    ) : filteredTeamMembers.length === 0 ? (
+                      <div className="compact-state">No members match this search.</div>
+                    ) : (
+                      <div className="team-table-wrap">
+                        <table className="team-table">
+                          <colgroup>
+                            <col className="team-col-member" />
+                            <col className="team-col-role" />
+                            <col className="team-col-status" />
+                            <col className="team-col-date" />
+                            <col className="team-col-actions" />
+                          </colgroup>
+                          <thead>
+                            <tr>
+                              <th>Member</th>
+                              <th>Role</th>
+                              <th>Status</th>
+                              <th>Joined</th>
+                              <th aria-label="Actions">{canManageTeam ? "Actions" : null}</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                          {filteredTeamMembers.map((member) => (
+                              <tr key={member.id}>
+                                <td>{member.email}</td>
+                                <td>{teamRoleLabel(member.role)}</td>
+                                <td>{member.status}</td>
+                                <td>
+                                  {member.joined_at
+                                    ? new Date(member.joined_at).toLocaleDateString()
+                                    : "—"}
+                                </td>
+                                <td>
+                                  {canManageTeam ? (
+                                    member.user_id !== user?.id &&
+                                    ((currentMembership?.role === "owner" &&
+                                      member.role !== "owner") ||
+                                      (currentMembership?.role === "admin" &&
+                                        member.role === "member")) ? (
+                                      <details className="team-actions">
+                                        <summary aria-label={`Actions for ${member.email}`}>
+                                          Actions
+                                        </summary>
+                                        <div className="team-action-menu">
+                                          {currentMembership?.role === "owner" && (
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                setRoleUpdate(
+                                                  member.role === "admin" ? "member" : "admin",
+                                                );
+                                                setTeamAction({ kind: "role", member });
+                                              }}
+                                            >
+                                              Change role
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={() => setTeamAction({ kind: "reset", member })}
+                                          >
+                                            Reset password
+                                          </button>
+                                          <button
+                                            className="danger-action"
+                                            type="button"
+                                            onClick={() =>
+                                              setTeamAction({ kind: "deactivate", member })
+                                            }
+                                          >
+                                            Deactivate access
+                                          </button>
+                                        </div>
+                                      </details>
+                                    ) : (
+                                      <span aria-label="No actions">—</span>
+                                    )
+                                  ) : (
+                                    <span aria-label="No actions">—</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                  <div className="team-card">
+                    <h3>Pending invitations</h3>
+                    {teamInvitations.length === 0 ? (
+                      <div className="compact-state">No pending invitations.</div>
+                    ) : filteredTeamInvitations.length === 0 ? (
+                      <div className="compact-state">No invitations match this search.</div>
+                    ) : (
+                      <div className="team-table-wrap">
+                        <table className="team-table">
+                          <colgroup>
+                            <col className="team-col-member" />
+                            <col className="team-col-role" />
+                            <col className="team-col-status" />
+                            <col className="team-col-date" />
+                            <col className="team-col-actions" />
+                          </colgroup>
+                          <thead>
+                            <tr>
+                              <th>Email</th>
+                              <th>Role</th>
+                              <th aria-label="Status" />
+                              <th>Expires</th>
+                              <th aria-label={canManageTeam ? "Actions" : undefined}>
+                                {canManageTeam ? "Actions" : null}
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                          {filteredTeamInvitations.map((invitation) => (
+                              <tr key={invitation.id}>
+                                <td>
+                                  {invitation.invited_email}
+                                  {newLinkInvitationId === invitation.id && (
+                                    <span className="team-status-badge">New link created</span>
+                                  )}
+                                </td>
+                                <td>{teamRoleLabel(invitation.role)}</td>
+                                <td />
+                                <td>{new Date(invitation.expires_at).toLocaleDateString()}</td>
+                                <td>
+                                  {canManageTeam &&
+                                    (currentMembership?.role === "owner" ||
+                                      invitation.role === "member") && (
+                                      <div className="inline-actions">
+                                        <button
+                                          className="text-button"
+                                          type="button"
+                                          disabled={teamLoading}
+                                          aria-label={
+                                            copiedInvitationId === invitation.id
+                                              ? "Copied"
+                                              : "Copy invitation link"
+                                          }
+                                          title={
+                                            copiedInvitationId === invitation.id
+                                              ? "Copied"
+                                              : "Copy invitation link"
+                                          }
+                                          onClick={() =>
+                                            invitationLink?.id === invitation.id
+                                              ? void copyInvitationLink(
+                                                  invitationLink.id,
+                                                  invitationLink.url,
+                                                )
+                                              : void resendInvitation(invitation)
+                                          }
+                                        >
+                                          {invitationLink?.id === invitation.id ? (
+                                            copiedInvitationId === invitation.id ? (
+                                              <CheckIcon />
+                                            ) : (
+                                              <CopyIcon />
+                                            )
+                                          ) : (
+                                            "Create link"
+                                          )}
+                                        </button>
+                                        <button
+                                          className="text-button danger-action"
+                                          type="button"
+                                          disabled={teamLoading}
+                                          onClick={() =>
+                                            setTeamAction({ kind: "revoke", invitation })
+                                          }
+                                        >
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+              {inviteOpen && (
+                <div className="dialog-backdrop" role="presentation">
+                  <form
+                    className="dialog-card"
+                    onSubmit={inviteMember}
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="invite-heading"
+                  >
+                    <h2 id="invite-heading">Invite member</h2>
+                    <p className="dialog-help">
+                      Choose how this person will help with the workspace. Passwords remain private.
+                    </p>
+                    <label>
+                      Email
+                      <input
+                        type="email"
+                        value={inviteEmail}
+                        onChange={(event) => setInviteEmail(event.target.value)}
+                        required
+                      />
+                    </label>
+                    <label>
+                      Role
+                      <select
+                        value={inviteRole}
+                        onChange={(event) => setInviteRole(event.target.value as typeof inviteRole)}
+                      >
+                        {canInviteAdmin && <option value="admin">Admin</option>}
+                        <option value="member">Team Member</option>
+                      </select>
+                    </label>
+                    <div className="dialog-actions">
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => setInviteOpen(false)}
+                      >
+                        Cancel
+                      </button>
+                      <button className="primary-button" disabled={teamLoading}>
+                        {teamLoading ? "Sending..." : "Send Invitation"}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              )}
+              {teamAction && (
+                <div className="dialog-backdrop" role="presentation">
+                  <div
+                    className="dialog-card"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-labelledby="team-action-heading"
+                  >
+                    <h2 id="team-action-heading">
+                      {teamAction.kind === "role" && "Change role"}
+                      {teamAction.kind === "deactivate" && "Deactivate access"}
+                      {teamAction.kind === "reset" && "Reset password"}
+                      {teamAction.kind === "revoke" && "Cancel invitation"}
+                    </h2>
+                    {teamAction.kind === "role" && (
+                      <>
+                        <p>Update access for {teamAction.member.email}.</p>
+                        <label>
+                          New role
+                          <select
+                            value={roleUpdate}
+                            onChange={(event) =>
+                              setRoleUpdate(event.target.value as "admin" | "member")
+                            }
+                          >
+                            <option value="admin">Admin</option>
+                            <option value="member">Team Member</option>
+                          </select>
+                        </label>
+                        <p className="dialog-help">
+                          Admins manage Team Members. Team Members handle daily Invoxa work without
+                          team administration.
+                        </p>
+                      </>
+                    )}
+                    {teamAction.kind === "deactivate" && (
+                      <p>
+                        This disables {teamAction.member.email}'s access to this workspace. Their
+                        account and workspace data remain intact.
+                      </p>
+                    )}
+                    {teamAction.kind === "reset" && (
+                      <p>
+                        The current password cannot be viewed. This starts the secure reset process
+                        while keeping the password private.
+                      </p>
+                    )}
+                    {teamAction.kind === "revoke" && (
+                      <p>
+                        This person will no longer be able to join this workspace using this
+                        invitation. Existing accounts will not be deleted.
+                      </p>
+                    )}
+                    <div className="dialog-actions">
+                      <button
+                        className="text-button"
+                        type="button"
+                        disabled={teamActionLoading}
+                        onClick={() => setTeamAction(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className={
+                          teamAction.kind === "deactivate" || teamAction.kind === "revoke"
+                            ? "danger-button"
+                            : "primary-button"
+                        }
+                        type="button"
+                        disabled={teamActionLoading}
+                        onClick={() => void runTeamAction()}
+                      >
+                        {teamActionLoading
+                          ? "Working..."
+                          : teamAction.kind === "deactivate"
+                            ? "Deactivate access"
+                            : teamAction.kind === "revoke"
+                              ? "Cancel invitation"
+                              : teamAction.kind === "reset"
+                                ? "Start reset"
+                                : "Save role"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {workspaceView === "usage" && (
+            <section className="phase-panel usage-page" aria-labelledby="usage-heading">
+              {usageLoading ? (
+                <div className="usage-loading" role="status">
+                  Loading plan and usage...
+                </div>
+              ) : usageError ? (
+                <div className="compact-state error-state" role="alert">
+                  <p>{usageError}</p>
+                  <button
+                    className="secondary-button"
+                    onClick={() => void loadUsage()}
+                    type="button"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : usage ? (
+                <>
+                  <article className="usage-plan-card">
+                    <div>
+                      <p className="eyebrow">Current plan</p>
+                      <h2 id="usage-heading">{usage.plan.name}</h2>
+                      <p>Plan limits and usage for this workspace.</p>
+                    </div>
+                    <span className="usage-plan-code">{usage.plan.code}</span>
+                  </article>
+                  <div className="usage-grid">
+                    <UsageMetric
+                      label="Monthly processing"
+                      used={usage.processing.used_pages}
+                      limit={usage.processing.limit_pages}
+                      remaining={usage.processing.remaining_pages}
+                      unit="pages"
+                    />
+                    <UsageMetric
+                      label="Active seats"
+                      used={usage.seats.used}
+                      limit={usage.seats.limit}
+                      remaining={usage.seats.remaining}
+                    />
+                    <UsageMetric
+                      label="Source storage"
+                      used={usage.storage.used_bytes}
+                      limit={usage.storage.limit_bytes}
+                      remaining={usage.storage.remaining_bytes}
+                      formatValue={formatUsageBytes}
+                    />
+                  </div>
+                  <p className="usage-period">
+                    Processing usage for {formatUsagePeriod(usage.processing.period)}.
+                  </p>
+                </>
+              ) : (
+                <div className="compact-state">Usage information is not available.</div>
+              )}
+            </section>
+          )}
 
           {workspaceView === "overview" && (
             <section className="phase-panel" aria-labelledby="overview-heading">
@@ -2335,6 +3862,177 @@ export function App() {
                       )}
                     </section>
 
+                    <section
+                      className="analysis-results-section"
+                      aria-labelledby="financial-validation-heading"
+                    >
+                      <div className="section-heading">
+                        <div>
+                          <h4 id="financial-validation-heading">Financial Validation</h4>
+                          <p className="section-supporting-copy">
+                            Arithmetic and invoice data consistency checks.
+                          </p>
+                        </div>
+                        {documentAnalysis && (
+                          <span
+                            className={`analysis-status ${(documentAnalysis.financial_validation_status ?? "WARNING").toLowerCase()}`}
+                          >
+                            {documentAnalysis.financial_validation_status ?? "WARNING"}
+                          </span>
+                        )}
+                      </div>
+                      {documentAnalysisLoading ? (
+                        <div className="compact-state" role="status">
+                          Loading financial validation...
+                        </div>
+                      ) : documentAnalysisError ? (
+                        <div className="compact-state error-state">
+                          <p>{documentAnalysisError}</p>
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            onClick={() => void loadDocumentAnalysis(selectedDocument.id)}
+                          >
+                            Retry analysis
+                          </button>
+                        </div>
+                      ) : !documentAnalysis ? (
+                        <div className="compact-state">
+                          Financial validation is not available yet.
+                        </div>
+                      ) : documentAnalysis.analysis_status === "pending" ? (
+                        <div className="compact-state">
+                          Analysis is pending while this document finishes processing.
+                        </div>
+                      ) : documentAnalysis.analysis_status === "failed" ? (
+                        <div className="compact-state error-state">
+                          {documentAnalysis.analysis_error || "Analysis could not be completed."}
+                        </div>
+                      ) : (
+                        <>
+                          <div className="analysis-counts" aria-label="Financial validation counts">
+                            <span>
+                              {documentAnalysis.financial_validation_counts?.passed ?? 0} passed
+                            </span>
+                            <span>
+                              {documentAnalysis.financial_validation_counts?.warning ?? 0} warnings
+                            </span>
+                            <span>
+                              {documentAnalysis.financial_validation_counts?.failed ?? 0} failed
+                            </span>
+                          </div>
+                          {(() => {
+                            const financialFindings = (documentAnalysis.findings ?? []).filter(
+                              (finding) => FINANCIAL_FINDING_CATEGORIES.has(finding.category),
+                            );
+                            return financialFindings.length > 0 ? (
+                              <div className="analysis-finding-list">
+                                {financialFindings.map((finding) => (
+                                  <article className="analysis-finding" key={finding.id}>
+                                    <div className="analysis-finding-heading">
+                                      <strong>{finding.title}</strong>
+                                      <span className={`severity-badge ${finding.severity}`}>
+                                        {finding.severity}
+                                      </span>
+                                    </div>
+                                    <p>{finding.explanation}</p>
+                                    {finding.affected_fields.length > 0 && (
+                                      <small>
+                                        Affected fields: {finding.affected_fields.join(", ")}
+                                      </small>
+                                    )}
+                                    {(finding.observed_value || finding.expected_value) && (
+                                      <div className="analysis-values">
+                                        {finding.observed_value && (
+                                          <span>Observed: {finding.observed_value}</span>
+                                        )}
+                                        {finding.expected_value && (
+                                          <span>Expected: {finding.expected_value}</span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </article>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="muted-copy">No financial consistency issues found.</p>
+                            );
+                          })()}
+                        </>
+                      )}
+                    </section>
+
+                    <section
+                      className="analysis-results-section"
+                      aria-labelledby="anomaly-detection-heading"
+                    >
+                      <div className="section-heading">
+                        <div>
+                          <h4 id="anomaly-detection-heading">Anomaly Detection</h4>
+                          <p className="section-supporting-copy">
+                            Duplicate and unusual-pattern signals for review.
+                          </p>
+                        </div>
+                        {documentAnalysis && (
+                          <span className="analysis-status neutral">
+                            {documentAnalysis.risk_level === "clear" ? "CLEAR" : "REVIEW"}
+                          </span>
+                        )}
+                      </div>
+                      {!documentAnalysis || documentAnalysisLoading ? (
+                        <div className="compact-state">
+                          {documentAnalysisLoading
+                            ? "Loading anomaly signals..."
+                            : "Anomaly analysis is not available yet."}
+                        </div>
+                      ) : documentAnalysis.analysis_status === "failed" ? (
+                        <div className="compact-state error-state">
+                          Anomaly analysis could not be completed.
+                        </div>
+                      ) : (
+                        (() => {
+                          const anomalyFindings = (documentAnalysis.findings ?? []).filter(
+                            (finding) => !FINANCIAL_FINDING_CATEGORIES.has(finding.category),
+                          );
+                          return anomalyFindings.length > 0 ? (
+                            <div className="analysis-finding-list">
+                              {anomalyFindings.map((finding) => (
+                                <article className="analysis-finding" key={finding.id}>
+                                  <div className="analysis-finding-heading">
+                                    <strong>{findingDisplayLabel(finding)}</strong>
+                                    <span className={`severity-badge ${finding.severity}`}>
+                                      {finding.severity}
+                                    </span>
+                                  </div>
+                                  <p>{finding.explanation}</p>
+                                  <div className="analysis-finding-meta">
+                                    <span>Status: {finding.status}</span>
+                                    {finding.confidence && (
+                                      <span>Confidence: {finding.confidence}</span>
+                                    )}
+                                  </div>
+                                  {(finding.observed_value || finding.expected_value) && (
+                                    <div className="analysis-values">
+                                      {finding.observed_value && (
+                                        <span>Observed: {finding.observed_value}</span>
+                                      )}
+                                      {finding.expected_value && (
+                                        <span>Baseline: {finding.expected_value}</span>
+                                      )}
+                                    </div>
+                                  )}
+                                </article>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted-copy">
+                              No anomaly signals detected. No review is currently recommended.
+                            </p>
+                          );
+                        })()
+                      )}
+                    </section>
+
                     <section className="extracted-section">
                       <div className="section-heading">
                         <h4>Extracted text</h4>
@@ -2416,7 +4114,8 @@ const rootElement = document.getElementById("root");
 if (rootElement) {
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
-      <App />
+      {window.location.pathname === "/confirm-email-change" ? <EmailChangeConfirmation /> :
+        window.location.pathname === "/reactivate-account" ? <AccountRecovery /> : <App />}
     </React.StrictMode>,
   );
 }

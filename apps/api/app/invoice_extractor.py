@@ -124,8 +124,6 @@ def _extract_line_items(text: str) -> list[InvoiceLineItem]:
         description = _normalize_text(values["description"])
         if quantity is None or unit_price is None or line_total is None or description is None:
             continue
-        if abs((quantity * unit_price) - line_total) > MATERIAL_AMOUNT_TOLERANCE:
-            continue
         items.append(
             InvoiceLineItem(
                 description=description,

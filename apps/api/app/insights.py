@@ -12,10 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from openpyxl import Workbook
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
-from apps.api.app.ai_analysis import analyze_document
+from apps.api.app.ai_analysis import analyze_document, financial_validation_summary
 from apps.api.app.auth import get_current_editor, get_current_user
 from apps.api.app.database import get_db
 from apps.api.app.export_service import sanitize_cell_text
@@ -28,7 +28,20 @@ from apps.api.app.models import (
     Document,
     DocumentStatus,
     InvoiceExtraction,
+    Organization,
     User,
+)
+from apps.api.app.plans import (
+    CAPABILITY_ADVANCED_ANOMALY_DETECTION,
+    DEFAULT_PLAN_CODE,
+    ENTERPRISE_PLAN_CODE,
+    PROFESSIONAL_PLAN_CODE,
+    resolve_plan_entitlements,
+)
+from apps.api.app.tenant import (
+    TenantContext,
+    TenantPermission,
+    require_tenant_permission,
 )
 
 router = APIRouter(tags=["AI Analysis", "analytics", "reports"])
@@ -85,6 +98,8 @@ class DocumentAnalysisSummary(BaseModel):
     risk_level: Literal["clear", "review", "high"]
     summary: str
     counts: dict[str, int]
+    financial_validation_status: Literal["PASSED", "WARNING", "FAILED"]
+    financial_validation_counts: dict[str, int]
     findings: list[FindingResponse]
 
 
@@ -148,10 +163,44 @@ def _filters(
     )
 
 
-def _document_statement(owner_id: uuid.UUID, filters: AnalyticsFilters):
+def _visible_finding_clause():
+    """Filter persisted findings too, including records created before a downgrade."""
+    advanced_plans = [
+        code
+        for code in (DEFAULT_PLAN_CODE, PROFESSIONAL_PLAN_CODE, ENTERPRISE_PLAN_CODE)
+        if resolve_plan_entitlements(code).includes(CAPABILITY_ADVANCED_ANOMALY_DETECTION)
+    ]
+    basic = or_(
+        AIFinding.category.not_in(
+            [AIFindingCategory.AMOUNT, AIFindingCategory.VENDOR, AIFindingCategory.DUPLICATE]
+        ),
+        and_(
+            AIFinding.category == AIFindingCategory.DUPLICATE,
+            AIFinding.title.in_(
+                ["Exact duplicate document detected", "Exact duplicate invoice detected"]
+            ),
+        ),
+    )
+    return or_(
+        basic,
+        AIFinding.document.has(
+            Document.organization.has(Organization.plan_code.in_(advanced_plans))
+        ),
+    )
+
+
+def _scope_predicate(owner_id: uuid.UUID, organization_id: uuid.UUID | None):
+    if organization_id is not None:
+        return Document.organization_id == organization_id
+    return and_(Document.owner_id == owner_id, Document.organization_id.is_(None))
+
+
+def _document_statement(
+    owner_id: uuid.UUID, filters: AnalyticsFilters, organization_id: uuid.UUID | None = None
+):
     statement = (
         select(Document)
-        .where(Document.owner_id == owner_id, Document.owner_id.is_not(None))
+        .where(_scope_predicate(owner_id, organization_id))
         .options(
             load_only(
                 Document.id,
@@ -162,8 +211,9 @@ def _document_statement(owner_id: uuid.UUID, filters: AnalyticsFilters):
                 Document.created_at,
             ),
             selectinload(Document.invoice_extraction),
-            selectinload(Document.ai_findings),
+            selectinload(Document.ai_findings.and_(_visible_finding_clause())),
         )
+        .execution_options(populate_existing=True)
     )
     if filters.start_date:
         statement = statement.where(
@@ -203,7 +253,9 @@ def _document_statement(owner_id: uuid.UUID, filters: AnalyticsFilters):
     if filters.ai_status:
         finding_criteria.append(AIFinding.status == filters.ai_status)
     if finding_criteria:
-        statement = statement.where(Document.ai_findings.any(and_(*finding_criteria)))
+        statement = statement.where(
+            Document.ai_findings.any(and_(_visible_finding_clause(), *finding_criteria))
+        )
     return statement
 
 
@@ -239,8 +291,14 @@ def list_findings(
     page_size: int = Query(25, ge=1, le=100),
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.READ)),  # noqa: B008
 ) -> PaginatedFindings:
-    clauses = [Document.owner_id == current_user.id, Document.owner_id.is_not(None)]
+    clauses = [
+        _visible_finding_clause(),
+        _scope_predicate(
+            current_user.id, tenant.organization.id if tenant.organization is not None else None
+        ),
+    ]
     if severity:
         clauses.append(AIFinding.severity == severity)
     if finding_status:
@@ -273,15 +331,26 @@ def document_analysis(
     document_id: uuid.UUID,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.READ)),  # noqa: B008
 ) -> DocumentAnalysisSummary:
     document = database.scalar(
         select(Document)
-        .where(Document.id == document_id, Document.owner_id == current_user.id)
-        .options(selectinload(Document.ai_findings))
+        .where(
+            Document.id == document_id,
+            _scope_predicate(
+                current_user.id,
+                tenant.organization.id if tenant.organization is not None else None,
+            ),
+        )
+        .options(selectinload(Document.ai_findings.and_(_visible_finding_clause())))
+        .execution_options(populate_existing=True)
     )
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
     risk, summary, counts = _risk_summary(document.ai_findings)
+    financial_status, financial_counts = financial_validation_summary(
+        document.invoice_extraction, document.ai_findings
+    )
     return DocumentAnalysisSummary(
         document_id=document.id,
         analysis_status=document.ai_analysis_status,
@@ -290,6 +359,8 @@ def document_analysis(
         risk_level=risk,
         summary=summary,
         counts=counts,
+        financial_validation_status=financial_status,
+        financial_validation_counts=financial_counts,
         findings=[FindingResponse.model_validate(finding) for finding in document.ai_findings],
     )
 
@@ -299,13 +370,20 @@ def reanalyze_document(
     document_id: uuid.UUID,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_editor),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.REVIEW_FINDINGS)),  # noqa: B008
 ) -> DocumentAnalysisSummary:
     document = database.scalar(
         select(Document)
-        .where(Document.id == document_id, Document.owner_id == current_user.id)
+        .where(
+            Document.id == document_id,
+            _scope_predicate(
+                current_user.id,
+                tenant.organization.id if tenant.organization is not None else None,
+            ),
+        )
         .options(
             selectinload(Document.invoice_extraction).selectinload(InvoiceExtraction.line_items),
-            selectinload(Document.ai_findings),
+            selectinload(Document.ai_findings.and_(_visible_finding_clause())),
         )
     )
     if document is None:
@@ -326,7 +404,7 @@ def reanalyze_document(
             )
             database.commit()
         raise HTTPException(status_code=503, detail="AI Analysis could not be completed.") from None
-    return document_analysis(document_id, database, current_user)
+    return document_analysis(document_id, database, current_user, tenant)
 
 
 @router.patch("/ai-analysis/findings/{finding_id}", response_model=FindingResponse)
@@ -335,14 +413,31 @@ def review_finding(
     payload: ReviewRequest,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_editor),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.REVIEW_FINDINGS)),  # noqa: B008
 ) -> AIFinding:
     finding = database.scalar(
         select(AIFinding)
         .join(Document)
-        .where(AIFinding.id == finding_id, Document.owner_id == current_user.id)
+        .where(
+            AIFinding.id == finding_id,
+            _visible_finding_clause(),
+            _scope_predicate(
+                current_user.id,
+                tenant.organization.id if tenant.organization is not None else None,
+            ),
+        )
     )
     if finding is None:
         raise HTTPException(status_code=404, detail="AI finding not found.")
+    document = finding.document
+    if (
+        document is not None
+        and document.is_finalized
+        and (tenant.membership is None or tenant.membership.role.name == "MEMBER")
+    ):
+        raise HTTPException(
+            status_code=403, detail="Finalized findings require administrator reopening."
+        )
     now = datetime.now(UTC)
     finding.status = payload.status
     finding.reviewed_by_id = current_user.id
@@ -452,6 +547,7 @@ def analytics_summary(
     mime_type: str | None = None,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.READ)),  # noqa: B008
 ) -> dict[str, object]:
     selected = _filters(
         range,
@@ -464,7 +560,17 @@ def analytics_summary(
         ai_status,
         mime_type,
     )
-    documents = database.scalars(_document_statement(current_user.id, selected)).unique().all()
+    documents = (
+        database.scalars(
+            _document_statement(
+                current_user.id,
+                selected,
+                tenant.organization.id if tenant.organization is not None else None,
+            )
+        )
+        .unique()
+        .all()
+    )
     return _analytics_payload(documents, selected)
 
 
@@ -524,9 +630,15 @@ def _report_payload(
 
 
 def _make_report(
-    database: Session, owner_id: uuid.UUID, report_type: ReportType, selected: AnalyticsFilters
+    database: Session,
+    owner_id: uuid.UUID,
+    report_type: ReportType,
+    selected: AnalyticsFilters,
+    organization_id: uuid.UUID | None = None,
 ) -> dict[str, object]:
-    documents = database.scalars(_document_statement(owner_id, selected)).unique().all()
+    documents = (
+        database.scalars(_document_statement(owner_id, selected, organization_id)).unique().all()
+    )
     analytics = _analytics_payload(documents, selected)
     report = _report_payload(report_type, analytics, documents)
     report["filters"] = selected.model_dump(mode="json")
@@ -542,9 +654,16 @@ def report_preview(
     vendor: str | None = None,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.READ)),  # noqa: B008
 ) -> dict[str, object]:
     selected = _filters(range, start_date, end_date, vendor, None, None, None, None, None)
-    return _make_report(database, current_user.id, report_type, selected)
+    return _make_report(
+        database,
+        current_user.id,
+        report_type,
+        selected,
+        tenant.organization.id if tenant.organization is not None else None,
+    )
 
 
 def _flat_rows(report: dict[str, object]) -> list[tuple[str, str]]:
@@ -567,9 +686,16 @@ def export_report(
     vendor: str | None = None,
     database: Session = Depends(get_db),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
+    tenant: TenantContext = Depends(require_tenant_permission(TenantPermission.EXPORT)),  # noqa: B008
 ) -> Response:
     selected = _filters(range, start_date, end_date, vendor, None, None, None, None, None)
-    report = _make_report(database, current_user.id, report_type, selected)
+    report = _make_report(
+        database,
+        current_user.id,
+        report_type,
+        selected,
+        tenant.organization.id if tenant.organization is not None else None,
+    )
     filename = f"invoxa-{report_type}-report-{datetime.now(UTC):%Y%m%d}.{export_format}"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     if export_format == "json":

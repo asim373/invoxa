@@ -21,6 +21,7 @@ dependencies = [
     "pypdfium2>=5.0,<6.0",
     "pydantic-settings>=2.6,<3.0",
     "pytesseract>=0.3.13,<1.0",
+    "pysaml2>=7.5.5,<8.0",
     "redis>=5.2,<6.0",
     "sqlalchemy>=2.0,<3.0",
     "Pillow>=10.0,<13.0",

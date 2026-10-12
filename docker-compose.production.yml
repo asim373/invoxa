@@ -1,9 +1,27 @@
 services:
+  storage-init:
+    image: ${INVOXA_API_IMAGE:?Set INVOXA_API_IMAGE to the reviewed API/worker image tag}
+
   api:
+    image: ${INVOXA_API_IMAGE:?Set INVOXA_API_IMAGE to the reviewed API/worker image tag}
+    environment:
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-production}
+      SAML_PUBLIC_BASE_URL: ${SAML_PUBLIC_BASE_URL:?Set SAML_PUBLIC_BASE_URL to the trusted HTTPS public API origin}
+      SCIM_PUBLIC_BASE_URL: ${SCIM_PUBLIC_BASE_URL:?Set SCIM_PUBLIC_BASE_URL to the trusted HTTPS public API origin}
     ports: !override
       - "127.0.0.1:${API_PORT:-8000}:8000"
 
+  worker:
+    image: ${INVOXA_API_IMAGE:?Set INVOXA_API_IMAGE to the reviewed API/worker image tag}
+    environment:
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-production}
+
   web:
+    build:
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?Set VITE_API_BASE_URL to the trusted HTTPS public API URL}
+        VITE_PUBLIC_APP_URL: ${VITE_PUBLIC_APP_URL:-}
+        VITE_BUILD_MODE: production
     ports: !override
       - "127.0.0.1:${WEB_PORT:-5173}:8080"
 

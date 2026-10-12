@@ -11,6 +11,7 @@ class FakeRedis:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.lists: dict[str, list[str | bytes]] = {}
+        self.values: dict[str, int] = {}
 
     def rpush(self, name: str, *values: str) -> int:
         self.calls.extend((name, value) for value in values)
@@ -48,7 +49,27 @@ class FakeRedis:
             return None
 
     def execute_command(self, *args: str | int | bytes):
-        inflight, queue, payload = str(args[3]), str(args[4]), args[5]
+        parts = list(args)
+        if len(parts) >= 7 and parts[0] == "EVAL" and parts[2] == 4:
+            priority_queue, normal_queue, inflight, fairness_key = map(str, parts[3:7])
+            priority_ready = bool(self.lists.get(priority_queue))
+            normal_ready = bool(self.lists.get(normal_queue))
+            streak = self.values.get(fairness_key, 0)
+            if priority_ready and normal_ready and streak >= 5:
+                source = normal_queue
+                self.values[fairness_key] = 0
+            elif priority_ready:
+                source = priority_queue
+                self.values[fairness_key] = streak + 1
+            elif normal_ready:
+                source = normal_queue
+                self.values[fairness_key] = 0
+            else:
+                return None
+            payload = self.lists[source].pop(0)
+            self.lists.setdefault(inflight, []).append(payload)
+            return payload
+        inflight, queue, payload = str(parts[3]), str(parts[4]), parts[5]
         assert isinstance(payload, (str, bytes))
         removed = self.lrem(inflight, 1, payload)
         if removed:
@@ -134,3 +155,35 @@ def test_reconciliation_does_not_duplicate_visible_job() -> None:
     assert queue.enqueue_if_missing(document_id) is True
     assert queue.enqueue_if_missing(document_id) is False
     assert len(client.lists["documents"]) == 1
+
+
+def test_priority_job_precedes_normal_job_and_preserves_fifo_within_class() -> None:
+    client = FakeRedis()
+    queue = DocumentProcessingQueue(client=client, queue_name="documents")
+    normal_old = uuid.uuid4()
+    normal_new = uuid.uuid4()
+    priority_old = uuid.uuid4()
+    priority_new = uuid.uuid4()
+    queue.enqueue(normal_old)
+    queue.enqueue(normal_new)
+    queue.enqueue(priority_old, priority="priority")
+    queue.enqueue(priority_new, priority="priority")
+
+    assert json.loads(queue.acquire() or "{}")["document_id"] == str(priority_old)
+    queue.acknowledge(json.dumps({"document_id": str(priority_old), "priority": "priority"}))
+    assert json.loads(queue.acquire() or "{}")["document_id"] == str(priority_new)
+
+
+def test_priority_selection_allows_normal_work_after_five_priority_jobs() -> None:
+    client = FakeRedis()
+    queue = DocumentProcessingQueue(client=client, queue_name="documents")
+    normal = uuid.uuid4()
+    queue.enqueue(normal)
+    for _ in range(5):
+        queue.enqueue(uuid.uuid4(), priority="priority")
+
+    for _ in range(5):
+        assert queue.acquire() is not None
+    selected = queue.acquire()
+    assert selected is not None
+    assert json.loads(selected)["document_id"] == str(normal)

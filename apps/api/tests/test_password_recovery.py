@@ -205,7 +205,9 @@ def test_recovery_endpoints_use_rate_limiter(recovery_client) -> None:
     client, _, _ = recovery_client
 
     class RejectingLimiter:
-        def check(self, scope: str, identifier: str, limit: int, window_seconds: int) -> None:
+        def check(
+            self, scope: str, identifier: str, limit: int, window_seconds: int, **_kwargs
+        ) -> None:
             raise HTTPException(status_code=429, detail="Too many requests.")
 
     app.dependency_overrides[get_rate_limiter] = lambda: RejectingLimiter()

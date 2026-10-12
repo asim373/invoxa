@@ -126,6 +126,336 @@ describe("document live status", () => {
   });
 });
 
+describe("commercial team management", () => {
+  beforeEach(() => {
+    localStorage.setItem("document_analyzer_token", "test-token");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  function teamFetch(role: "owner" | "admin" | "member") {
+    return vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith("/team/members")) {
+        return Promise.resolve(
+          response([
+            {
+              id: "membership-1",
+              user_id: "user-1",
+              email: user.email,
+              role,
+              status: "active",
+              joined_at: timestamp,
+            },
+          ]),
+        );
+      }
+      if (url.endsWith("/team/invitations")) return Promise.resolve(response([]));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+  }
+
+  it("shows the owner invite flow with only Admin and Team Member roles", async () => {
+    teamFetch("owner");
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Invite member" })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Invite member" }));
+    expect(screen.getByRole("option", { name: "Admin" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Team Member" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Owner" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Reviewer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Viewer" })).not.toBeInTheDocument();
+  });
+
+  it("hides management controls for a Team Member", async () => {
+    teamFetch("member");
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    await waitFor(() => expect(screen.getByText("Team Member")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Invite member" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Actions")).not.toBeInTheDocument();
+  });
+
+  it("filters active members and pending invitations by email", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me"))
+        return Promise.resolve(response({ ...user, membership_role: "owner", organization_id: "org-1" }));
+      if (url.endsWith("/team/members"))
+        return Promise.resolve(
+          response([
+            { id: "owner-link", user_id: user.id, email: "owner@example.com", role: "owner", status: "active", joined_at: timestamp },
+            { id: "member-link", user_id: "member-1", email: "alex@example.com", role: "member", status: "active", joined_at: timestamp },
+          ]),
+        );
+      if (url.endsWith("/team/invitations"))
+        return Promise.resolve(response([
+          { id: "invite-1", invited_email: "alex.invited@example.com", role: "member", status: "pending", expires_at: timestamp },
+        ]));
+      return Promise.resolve(response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }));
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    await screen.findByText("alex@example.com");
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search members and invitations" }), {
+      target: { value: "invited" },
+    });
+    expect(screen.queryByText("alex@example.com")).not.toBeInTheDocument();
+    expect(screen.getByText("alex.invited@example.com")).toBeInTheDocument();
+  });
+
+  it("shows the seat-limit error instead of invitation success", async () => {
+    const fetchMock = teamFetch("owner");
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith("/team/members"))
+        return Promise.resolve(
+          response([
+            {
+              id: "membership-1",
+              user_id: user.id,
+              email: user.email,
+              role: "owner",
+              status: "active",
+              joined_at: timestamp,
+            },
+          ]),
+        );
+      if (url.endsWith("/team/invitations") && (init?.method ?? "GET") === "POST") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              detail:
+                "Your workspace has reached its active seat limit. Remove an active member or upgrade your plan to invite another member.",
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      if (url.endsWith("/team/invitations")) return Promise.resolve(response([]));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Invite member" })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Invite member" }));
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "blocked@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send Invitation" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "Your workspace has reached its active seat limit. Remove an active member or upgrade your plan to invite another member.",
+        ),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/Invitation sent to/)).not.toBeInTheDocument();
+    expect(screen.getByTestId("team-alert-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("team-success-icon")).not.toBeInTheDocument();
+  });
+
+  it("shows a green check icon for a successful invitation", async () => {
+    const fetchMock = teamFetch("owner");
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.endsWith("/team/members"))
+        return Promise.resolve(
+          response([
+            {
+              id: "membership-1",
+              user_id: user.id,
+              email: user.email,
+              role: "owner",
+              status: "active",
+              joined_at: timestamp,
+            },
+          ]),
+        );
+      if (url.endsWith("/team/invitations") && (init?.method ?? "GET") === "POST")
+        return Promise.resolve(
+          response({
+            id: "invitation-1",
+            invited_email: "success@example.com",
+            role: "member",
+            status: "pending",
+            expires_at: timestamp,
+            invitation_token: "secure-invitation-token",
+          }),
+        );
+      if (url.endsWith("/team/invitations")) return Promise.resolve(response([]));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Invite member" })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Invite member" }));
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "success@example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send Invitation" }));
+    await waitFor(() =>
+      expect(screen.getByText("Invitation sent to success@example.com.")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("team-success-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("team-alert-icon")).not.toBeInTheDocument();
+  });
+});
+
+describe("plan and usage", () => {
+  beforeEach(() => {
+    localStorage.setItem("document_analyzer_token", "test-token");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("renders authoritative plan and usage values, including zero usage", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.includes("/organizations/usage"))
+        return Promise.resolve(
+          response({
+            plan: { code: "standard", name: "Standard" },
+            processing: {
+              period: "2026-09",
+              used_pages: 0,
+              limit_pages: 1000,
+              remaining_pages: 1000,
+            },
+            seats: { used: 1, limit: 1, remaining: 0 },
+            storage: { used_bytes: 1048576, limit_bytes: 2000000000, remaining_bytes: 1998951424 },
+          }),
+        );
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Plan & Usage" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Standard" })).toBeInTheDocument(),
+    );
+    expect(screen.getByText("Monthly processing").parentElement?.parentElement).toHaveTextContent(
+      "0 of 1000",
+    );
+    expect(screen.getByText("Active seats").parentElement?.parentElement).toHaveTextContent(
+      "1 of 1",
+    );
+    expect(screen.getByText("Source storage").parentElement?.parentElement).toHaveTextContent(
+      "1.0 MB of 2.0 GB",
+    );
+    expect(screen.queryByText(/price|upgrade|checkout|billing/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a retryable error instead of fabricating usage values", async () => {
+    let usageRequests = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      if (url.includes("/organizations/usage")) {
+        usageRequests += 1;
+        return Promise.resolve(new Response("usage unavailable", { status: 503 }));
+      }
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Plan & Usage" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.getByText(/request failed with status 503/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Standard|of 1000|remaining/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(usageRequests).toBe(2));
+  });
+});
+
+describe("invitation acceptance", () => {
+  beforeEach(() => {
+    window.history.pushState({}, "", "/invite/accept?token=secure-invite-token");
+  });
+
+  afterEach(() => {
+    window.history.pushState({}, "", "/");
+    vi.restoreAllMocks();
+  });
+
+  it("renders a server-derived invitation without company setup fields", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      if (String(input).endsWith("/auth/google/config"))
+        return Promise.resolve(response({ enabled: true }));
+      if (String(input).includes("/team/invitations/preview")) {
+        return Promise.resolve(
+          response({
+            organization_id: "org-1",
+            organization_name: "Atlas Business Services",
+            invited_email: "employee@example.com",
+            role: "MEMBER",
+            expires_at: timestamp,
+          }),
+        );
+      }
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 20, total_pages: 0 }),
+      );
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Atlas Business Services")).toBeInTheDocument());
+    expect(screen.getByText("Team Member")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "You're invited to join Invoxa" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("OR")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Continue with Google/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Create account and join" }));
+    expect(screen.getByDisplayValue("employee@example.com")).toHaveAttribute("readonly");
+    expect(screen.queryByLabelText("Company name")).not.toBeInTheDocument();
+    expect(screen.queryByText("MEMBER")).not.toBeInTheDocument();
+  });
+
+  it("renders invalid invitations as a human-readable error", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Invitation is invalid or expired."));
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("invitation has expired"),
+    );
+    expect(screen.queryByText("secure-invite-token")).not.toBeInTheDocument();
+  });
+});
+
 describe("professional document detail", () => {
   beforeEach(() => {
     localStorage.setItem("document_analyzer_token", "test-token");
@@ -377,6 +707,52 @@ describe("commercial authentication interface", () => {
     );
     expect(localStorage.getItem("document_analyzer_token")).toBe("google-invoxa-token");
     expect(window.location.search).toBe("");
+  });
+
+  it("exchanges a one-time SAML callback code and binds the selected workspace", async () => {
+    const code = "s".repeat(64);
+    const organizationId = "00000000-0000-4000-8000-000000000099";
+    window.history.replaceState({}, "", `/#saml_code=${code}`);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input);
+      if (url.endsWith("/auth/google/config")) return Promise.resolve(response({ enabled: false }));
+      if (url.endsWith("/auth/saml/exchange")) {
+        return Promise.resolve(
+          response({ access_token: "saml-invoxa-token", organization_id: organizationId }),
+        );
+      }
+      if (url.endsWith("/auth/me")) return Promise.resolve(response(user));
+      return Promise.resolve(
+        response({ items: [], total: 0, page: 1, page_size: 100, total_pages: 0 }),
+      );
+    });
+
+    render(<App />);
+    await flush();
+    await flush();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/auth/saml/exchange",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ code }) }),
+    );
+    expect(localStorage.getItem("document_analyzer_token")).toBe("saml-invoxa-token");
+    expect(localStorage.getItem("document_analyzer_organization_id")).toBe(organizationId);
+    expect(window.location.hash).toBe("");
+  });
+
+  it("offers workspace SSO while rejecting malformed workspace slugs locally", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response({ enabled: false }));
+    render(<App />);
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Continue with workspace SSO" }));
+    fireEvent.change(screen.getByLabelText("Workspace slug"), {
+      target: { value: "../another-tenant" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Continue to SSO" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "workspace slug provided by your administrator",
+    );
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
   });
 });
 
@@ -737,7 +1113,7 @@ describe("password recovery", () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Forgot password?" }));
     fireEvent.change(screen.getByLabelText("Email"), { target: { value: "person@example.com" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send reset instructions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset Password" }));
     await flush();
 
     expect(screen.getByRole("status")).toHaveTextContent("If an account exists");

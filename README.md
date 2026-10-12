@@ -26,6 +26,12 @@ PostgreSQL, and a responsive React interface without requiring a paid AI or LLM 
 - Finding acknowledgement, resolution, reopening, evidence, severity, status, and source-document drill-down
 - Server-side KPIs, trends, multi-currency-safe totals, and financial/AI/processing reports
 - CSV, XLSX, and JSON document/report exports with spreadsheet-injection protection
+- Organization settings, invitations, team roles, and tenant-scoped member administration
+- Email verification, password recovery, profile/email-change controls, and account lifecycle safeguards
+- Durable transactional email delivery through a database outbox and worker retries
+- Standard, Professional, and Enterprise plan entitlements with page, storage, and seat usage visibility
+- Organization-scoped SAML SSO, SCIM provisioning, security policies, and audit events
+- Organization-scoped API credentials, read-only external document listing, and signed webhooks
 - Responsive commercial UI, health/readiness checks, structured logs, rate limiting, and Docker deployment assets
 
 ## Engineering highlights
@@ -103,6 +109,30 @@ See [Architecture](docs/ARCHITECTURE.md), [Deployment](docs/DEPLOYMENT.md), and 
 | Exports | Python CSV/JSON, openpyxl |
 | Quality | pytest, Vitest, Ruff, Pyright, ESLint, Prettier |
 
+## Plans and usage
+
+The customer-facing plans page lists Standard at **$99/month or $990/year** and Professional at
+**$249/month or $2,490/year**. Standard includes 1,000 processing pages/month, 2 GB of source
+storage, and one active seat. Professional includes 5,000 pages/month, 10 GB, and five active
+seats. Enterprise pricing is custom, with organization-specific limits and enterprise identity
+features. The application displays current plan and usage entitlements; checkout, payment,
+subscription activation, and billing management are not implemented.
+
+## Development status
+
+- Phases 1–6: completed, including enterprise security and deployment-readiness verification.
+- Phase 7 — Billing and subscriptions: pending; no payment provider or subscription activation is
+  represented as available.
+- Phase 8 — Customer account lifecycle: closed.
+- Phase 9 — Commercial administration and customer experience: closed.
+- External API expansion: pending; the supported external document API is read-only.
+- Phase 10: pending.
+
+These milestones describe verified development scope, not a production launch or a claim that the
+service is fully commercially operational. Deployment-specific DNS/TLS, secret management, email
+deliverability, backups, monitoring, and customer identity-provider configuration remain operator
+responsibilities.
+
 ## Repository structure
 
 ```text
@@ -130,6 +160,11 @@ Copy-Item .env.example .env
 docker compose up --build -d
 docker compose ps
 ```
+
+The default Compose workflow builds the web bundle in Vite `development` mode so its explicit
+loopback API URL remains valid for local Docker use. This is intentionally distinct from the
+production Compose overlay, which forces a production build and requires trusted HTTPS public
+origins. Do not set `VITE_BUILD_MODE=production` with a localhost API URL.
 
 Replace local placeholders in `.env` before starting. Open:
 

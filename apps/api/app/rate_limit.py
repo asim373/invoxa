@@ -26,7 +26,15 @@ class RateLimiter:
     def __init__(self, client: RateLimitClient | None = None) -> None:
         self.client = client or cast(RateLimitClient, get_redis_client())
 
-    def check(self, scope: str, identifier: str, limit: int, window_seconds: int) -> None:
+    def check(
+        self,
+        scope: str,
+        identifier: str,
+        limit: int,
+        window_seconds: int,
+        *,
+        fail_closed: bool = False,
+    ) -> None:
         if not settings.rate_limit_enabled:
             return
         digest = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
@@ -34,9 +42,16 @@ class RateLimiter:
         try:
             count = int(self.client.eval(INCREMENT_WITH_EXPIRY, 1, key, window_seconds))
         except redis.RedisError:
-            # Authentication and uploads remain available during a Redis outage;
-            # readiness monitoring still reports Redis as unavailable.
+            # Sensitive auth, SAML, SCIM and administration callers opt into
+            # fail-closed behavior. Upload and external read traffic retain the
+            # documented availability-first policy during Redis outages.
             logger.exception("rate_limit_backend_unavailable scope=%s", scope)
+            if fail_closed:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Request protection is temporarily unavailable.",
+                    headers={"Retry-After": str(window_seconds)},
+                ) from None
             return
         if count > limit:
             logger.warning("rate_limit_exceeded scope=%s", scope)

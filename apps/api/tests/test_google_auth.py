@@ -27,7 +27,7 @@ def google_configuration(monkeypatch):
 
 
 def test_google_start_uses_state_nonce_pkce_and_secure_transaction_cookie(
-    google_configuration,
+    google_configuration, monkeypatch
 ) -> None:
     client = TestClient(app)
     response = client.get("/auth/google/start", follow_redirects=False)
@@ -42,6 +42,16 @@ def test_google_start_uses_state_nonce_pkce_and_secure_transaction_cookie(
     assert "HttpOnly" in cookie
     assert "SameSite=lax" in cookie
     assert "Path=/auth/google" in cookie
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+def test_google_transaction_cookie_is_secure_in_production_like_environments(
+    google_configuration, monkeypatch, environment
+) -> None:
+    monkeypatch.setattr(settings, "app_environment", environment)
+    response = TestClient(app).get("/auth/google/start", follow_redirects=False)
+    assert response.status_code == 302
+    assert "; Secure" in response.headers["set-cookie"]
 
 
 def test_google_start_is_unavailable_without_credentials(monkeypatch) -> None:
@@ -130,7 +140,7 @@ def test_google_callback_links_verified_existing_user_and_issues_one_time_code(
     database.commit.assert_called_once()
 
 
-def test_google_callback_creates_new_reviewer_without_usable_local_password(
+def test_google_callback_stages_new_identity_for_company_onboarding(
     google_configuration, monkeypatch
 ) -> None:
     database = MagicMock(spec=Session)
@@ -165,11 +175,10 @@ def test_google_callback_creates_new_reviewer_without_usable_local_password(
     app.dependency_overrides.clear()
 
     assert response.status_code == 303
-    user = next(value for value in added if isinstance(value, User))
-    assert user.email == "new@example.com"
-    assert user.role == UserRole.REVIEWER
-    assert user.password_hash != ""
-    assert any(isinstance(value, OAuthIdentity) for value in added)
+    onboarding = parse_qs(urlparse(response.headers["location"]).query)["google_onboarding"][0]
+    assert onboarding
+    assert not any(isinstance(value, User) for value in added)
+    assert not any(isinstance(value, OAuthIdentity) for value in added)
 
 
 def test_google_callback_rejects_invalid_state_and_provider_failure(

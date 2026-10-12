@@ -4,8 +4,9 @@ import statistics
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, selectinload
 
 from apps.api.app.models import (
@@ -16,12 +17,55 @@ from apps.api.app.models import (
     Document,
     DocumentStatus,
     InvoiceExtraction,
+    Organization,
+)
+from apps.api.app.plans import (
+    CAPABILITY_ADVANCED_ANOMALY_DETECTION,
+    resolve_organization_entitlements,
 )
 
 logger = logging.getLogger(__name__)
 MONEY_TOLERANCE = Decimal("0.02")
 MIN_GLOBAL_SAMPLE = 5
 MIN_VENDOR_SAMPLE = 4
+MAX_ANOMALY_HISTORY = 500
+FinancialValidationStatus = Literal["PASSED", "WARNING", "FAILED"]
+
+
+def financial_validation_summary(
+    extraction: InvoiceExtraction | None, findings: list[AIFinding]
+) -> tuple[FinancialValidationStatus, dict[str, int]]:
+    """Return a deterministic financial result without creating another finding store."""
+    counts = {"passed": 0, "warning": 0, "failed": 0}
+    financial_categories = {
+        AIFindingCategory.ARITHMETIC,
+        AIFindingCategory.MISSING,
+        AIFindingCategory.TAX,
+        AIFindingCategory.DATE,
+        AIFindingCategory.CONFIDENCE,
+    }
+    relevant = [finding for finding in findings if finding.category in financial_categories]
+    failed = any(finding.category is AIFindingCategory.ARITHMETIC for finding in relevant)
+    if extraction is not None and not extraction.is_valid:
+        failed = True
+    warnings = any(
+        finding.category
+        in {
+            AIFindingCategory.MISSING,
+            AIFindingCategory.TAX,
+            AIFindingCategory.DATE,
+            AIFindingCategory.CONFIDENCE,
+        }
+        for finding in relevant
+    )
+    if failed:
+        counts["failed"] = 1
+        return "FAILED", counts
+    if warnings:
+        counts["warning"] = 1
+        return "WARNING", counts
+    counts["passed"] = 1
+    return "PASSED", counts
 
 
 @dataclass(frozen=True)
@@ -41,6 +85,12 @@ class FindingSpec:
     def signature(self) -> str:
         raw = f"{self.category.value}:{self.key}".encode()
         return hashlib.sha256(raw).hexdigest()
+
+
+def _document_scope(document: Document):
+    if document.organization_id is not None:
+        return Document.organization_id == document.organization_id
+    return and_(Document.owner_id == document.owner_id, Document.organization_id.is_(None))
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -214,18 +264,21 @@ def _date_findings(document: Document, extraction: InvoiceExtraction) -> list[Fi
 
 
 def _duplicate_findings(
-    database: Session, document: Document, extraction: InvoiceExtraction
+    database: Session, document: Document, extraction: InvoiceExtraction, *, advanced: bool
 ) -> list[FindingSpec]:
     candidates = database.scalars(
         select(Document)
         .where(
-            Document.owner_id == document.owner_id,
+            _document_scope(document),
             Document.id != document.id,
             Document.status == DocumentStatus.COMPLETED,
         )
+        .order_by(Document.created_at.desc(), Document.id.desc())
+        .limit(MAX_ANOMALY_HISTORY)
         .options(selectinload(Document.invoice_extraction))
     ).all()
     current_vendor = _normalized(extraction.vendor_name)
+    probable: FindingSpec | None = None
     for candidate in candidates:
         other = candidate.invoice_extraction
         if candidate.checksum == document.checksum:
@@ -278,23 +331,26 @@ def _duplicate_findings(
                     confidence=Decimal("0.9800"),
                 )
             ]
-        if len(signals) >= 3 and ("invoice number" in signals or "currency and total" in signals):
+        if (
+            advanced
+            and probable is None
+            and len(signals) >= 3
+            and ("invoice number" in signals or "currency and total" in signals)
+        ):
             confidence = Decimal("0.8000") if len(signals) == 3 else Decimal("0.9000")
-            return [
-                FindingSpec(
-                    key=f"probable-{candidate.id}",
-                    category=AIFindingCategory.DUPLICATE,
-                    severity=AIFindingSeverity.MEDIUM,
-                    title="Possible duplicate invoice",
-                    explanation=(
-                        f"This invoice shares {', '.join(signals)} with "
-                        f"{candidate.original_filename}; review both documents."
-                    ),
-                    evidence={"related_document_id": str(candidate.id), "signals": signals},
-                    confidence=confidence,
-                )
-            ]
-    return []
+            probable = FindingSpec(
+                key=f"probable-{candidate.id}",
+                category=AIFindingCategory.DUPLICATE,
+                severity=AIFindingSeverity.MEDIUM,
+                title="Possible duplicate invoice",
+                explanation=(
+                    f"This invoice shares {', '.join(signals)} with "
+                    f"{candidate.original_filename}; review both documents."
+                ),
+                evidence={"related_document_id": str(candidate.id), "signals": signals},
+                confidence=confidence,
+            )
+    return [probable] if probable is not None else []
 
 
 def _robust_anomaly(values: list[Decimal], current: Decimal) -> tuple[bool, Decimal, Decimal]:
@@ -318,12 +374,14 @@ def _amount_findings(
         select(InvoiceExtraction.total, InvoiceExtraction.vendor_name)
         .join(Document, Document.id == InvoiceExtraction.document_id)
         .where(
-            Document.owner_id == document.owner_id,
+            _document_scope(document),
             Document.id != document.id,
             Document.status == DocumentStatus.COMPLETED,
             InvoiceExtraction.currency == extraction.currency,
             InvoiceExtraction.total.is_not(None),
         )
+        .order_by(Document.created_at.desc(), Document.id.desc())
+        .limit(MAX_ANOMALY_HISTORY)
     ).all()
     findings: list[FindingSpec] = []
     totals = [row.total for row in rows if row.total is not None]
@@ -412,8 +470,17 @@ def generate_finding_specs(database: Session, document: Document) -> list[Findin
     findings.extend(_arithmetic_findings(extraction))
     findings.extend(_tax_findings(extraction))
     findings.extend(_date_findings(document, extraction))
-    findings.extend(_duplicate_findings(database, document, extraction))
-    findings.extend(_amount_findings(database, document, extraction))
+    organization = (
+        database.get(Organization, document.organization_id)
+        if document.organization_id is not None
+        else None
+    )
+    advanced = organization is not None and resolve_organization_entitlements(
+        organization
+    ).includes(CAPABILITY_ADVANCED_ANOMALY_DETECTION)
+    findings.extend(_duplicate_findings(database, document, extraction, advanced=advanced))
+    if advanced:
+        findings.extend(_amount_findings(database, document, extraction))
     if not extraction.is_valid and extraction.validation_error:
         findings.append(
             FindingSpec(

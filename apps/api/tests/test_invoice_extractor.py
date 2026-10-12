@@ -147,6 +147,13 @@ def test_marks_line_item_subtotal_mismatch_invalid() -> None:
     assert result.validation_error == "Line item totals do not match subtotal."
 
 
+def test_preserves_numeric_line_item_mismatch_for_explainable_validation() -> None:
+    result = extract_invoice_fields("Product A | 2 | 10.00 | 25.00\nSubtotal: 25.00")
+
+    assert len(result.line_items) == 1
+    assert result.line_items[0].line_total == Decimal("25.00")
+
+
 def test_empty_invoice_has_no_line_items() -> None:
     result = extract_invoice_fields("Invoice Number: INV-4\nSubtotal: 0.00")
 

@@ -27,3 +27,17 @@ multimedia-player/
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+# Local customer/QA data and verification artifacts; never publish backups or account evidence.
+/.pytest-temp/
+/phase8-backups/
+/phase8-evidence/
+/phase9-evidence/
+/video-production/
+/qa_saml_*.yml
+/qa_scim_interop_*.yml
+/qa_scim_interop_runtime.py
+/apps/api/tests/phase8_*
+/apps/api/tests/saml_postgres_verification.py
+/docs/PHASE8_*.md
+/docs/STEP7_PRE_BILLING_VERIFICATION.md
